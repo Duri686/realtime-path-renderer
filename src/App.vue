@@ -124,10 +124,10 @@
 import { ref, reactive, onMounted, onUnmounted, watch } from 'vue';
 import { WebGLRenderer } from './renderer/WebGLRenderer';
 import { KonvaLayer } from './renderer/KonvaLayer';
-import { RealRobotSimulator } from './simulator/RealRobotSimulator';
 import { PathTracker } from './utils/PathTracker';
 import { RobotMarkers } from './renderer/RobotMarkers';
 import DataWorker from './workers/dataProcessor.worker.js?worker';
+import SimulatorWorker from './simulator/simulator.worker.js?worker';
 import PerformanceChart from './components/PerformanceChart.vue';
 
 export default {
@@ -161,7 +161,7 @@ export default {
     // 渲染器实例
     let webglRenderer = null;
     let konvaLayer = null;
-    let wsSimulator = null;
+    let simulatorWorker = null; // <--- Renamed from wsSimulator
     let dataWorker = null;
     let pathTracker = null;
     let robotMarkers = null;
@@ -169,6 +169,9 @@ export default {
     let lastFrameTime = 0;
     let frameCount = 0;
     let fpsUpdateTime = 0;
+    let lastDataBounds = null;
+    let lastMarkersUpdate = 0;
+    const markersUpdateInterval = 50;
     // 清空状态控制
     let clearAwaiting = false;
     let resumeAfterClear = false;
@@ -190,7 +193,7 @@ export default {
 
     // 初始化WebGL渲染器
     const initWebGL = () => {
-      console.log('App: 初始化WebGL渲染器', {
+      console.debug('App: 初始化WebGL渲染器', {
         canvas: webglCanvas.value,
         size: { width: canvasSize.width, height: canvasSize.height },
       });
@@ -198,7 +201,7 @@ export default {
       webglRenderer.init();
       // 立即同步一次尺寸，确保viewport与CSS尺寸/DPR一致
       webglRenderer.resize(canvasSize.width, canvasSize.height);
-      console.log('App: WebGL渲染器初始化完成');
+      console.debug('App: WebGL渲染器初始化完成');
     };
 
     // 初始化Konva层
@@ -225,21 +228,19 @@ export default {
     const initWorker = () => {
       dataWorker = new DataWorker();
 
-      // 配置Worker
+      // 配置Worker（使用顶层字段，匹配 worker 的 updateConfig 期望）
       dataWorker.postMessage({
         type: 'config',
-        config: {
-          lodThreshold: lodThreshold.value,
-          viewBounds: {
-            left: 0,
-            top: 0,
-            right: canvasSize.width,
-            bottom: canvasSize.height,
-          },
-          maxPoints: 200000,
-          enableLOD: true,
-          enableCulling: false,
+        lodThreshold: lodThreshold.value,
+        viewBounds: {
+          left: 0,
+          top: 0,
+          right: canvasSize.width,
+          bottom: canvasSize.height,
         },
+        maxPoints: 200000,
+        enableLOD: true,
+        enableCulling: false,
       });
 
       // 处理Worker消息
@@ -278,8 +279,8 @@ export default {
             pathTracker.latestPoint = null;
           }
           // 根据标志恢复模拟
-          if (resumeAfterClear && wsSimulator) {
-            wsSimulator.start();
+          if (resumeAfterClear && simulatorWorker) {
+            simulatorWorker.postMessage({ type: 'start' });
             isSimulating.value = true;
           }
           clearAwaiting = false;
@@ -288,21 +289,28 @@ export default {
       };
     };
 
-    // 初始化WebSocket模拟器
+    // 初始化WebSocket模拟器 (现在是Worker)
     const initSimulator = () => {
-      // 使用真实机器人模拟器
-      wsSimulator = new RealRobotSimulator({
-        pushInterval: wsInterval.value,
-        pointsPerPush: pointsPerMessage.value,
-        robotCount: robotCount.value,
-        canvasWidth: canvasSize.width,
-        canvasHeight: canvasSize.height,
+      simulatorWorker = new SimulatorWorker();
+
+      // 初始化Worker
+      simulatorWorker.postMessage({
+        type: 'init',
+        config: {
+          pushInterval: wsInterval.value,
+          pointsPerPush: pointsPerMessage.value,
+          robotCount: robotCount.value,
+          canvasWidth: canvasSize.width,
+          canvasHeight: canvasSize.height,
+        }
       });
 
-      wsSimulator.onMessage((points) => {
-        // 将原始数据发送到Worker处理
+      // 监听来自模拟器Worker的消息
+      simulatorWorker.onmessage = (e) => {
+        const pointsBuffer = e.data;
+        const points = new Float32Array(pointsBuffer);
+        // 将原始数据发送到数据处理Worker
         if (dataWorker) {
-          // 将 reactive 对象转换为普通对象
           const transformData = {
             scale: viewTransform.scale,
             translateX: viewTransform.translateX,
@@ -315,10 +323,10 @@ export default {
               points: points,
               transform: transformData,
             },
-            [points.buffer],
+            [pointsBuffer], // 零拷贝传输
           );
         }
-      });
+      };
     };
 
     // 渲染循环
@@ -347,6 +355,66 @@ export default {
           },
           canvas: { w: canvasSize.width, h: canvasSize.height },
         });
+
+        const fpsVal = stats.fps;
+        if (fpsVal <= 25) {
+          console.warn('[PERF_DEGRADE] FPS_LOW_25', {
+            fps: fpsVal,
+            totalPoints: stats.totalPoints,
+            workerProcessTime: Number(stats.workerProcessTime),
+            renderTime: Number(stats.renderTime),
+            lastBufferUpdateTime: Number(stats.lastBufferUpdateTime),
+            lodThreshold: Number(lodThreshold.value),
+            culling: currentCulling,
+            wsInterval: Number(wsInterval.value),
+            pointsPerMessage: Number(pointsPerMessage.value),
+            robotCount: Number(robotCount.value),
+            transform: {
+              scale: viewTransform.scale,
+              x: viewTransform.translateX,
+              y: viewTransform.translateY,
+            },
+            canvas: { w: canvasSize.width, h: canvasSize.height },
+          });
+        } else if (fpsVal < 30) {
+          console.warn('[PERF_DEGRADE] FPS_LOW_30', {
+            fps: fpsVal,
+            totalPoints: stats.totalPoints,
+            workerProcessTime: Number(stats.workerProcessTime),
+            renderTime: Number(stats.renderTime),
+            lastBufferUpdateTime: Number(stats.lastBufferUpdateTime),
+            lodThreshold: Number(lodThreshold.value),
+            culling: currentCulling,
+            wsInterval: Number(wsInterval.value),
+            pointsPerMessage: Number(pointsPerMessage.value),
+            robotCount: Number(robotCount.value),
+            transform: {
+              scale: viewTransform.scale,
+              x: viewTransform.translateX,
+              y: viewTransform.translateY,
+            },
+            canvas: { w: canvasSize.width, h: canvasSize.height },
+          });
+        } else if (fpsVal < 45) {
+          console.warn('[PERF_DEGRADE] FPS_LOW_45', {
+            fps: fpsVal,
+            totalPoints: stats.totalPoints,
+            workerProcessTime: Number(stats.workerProcessTime),
+            renderTime: Number(stats.renderTime),
+            lastBufferUpdateTime: Number(stats.lastBufferUpdateTime),
+            lodThreshold: Number(lodThreshold.value),
+            culling: currentCulling,
+            wsInterval: Number(wsInterval.value),
+            pointsPerMessage: Number(pointsPerMessage.value),
+            robotCount: Number(robotCount.value),
+            transform: {
+              scale: viewTransform.scale,
+              x: viewTransform.translateX,
+              y: viewTransform.translateY,
+            },
+            canvas: { w: canvasSize.width, h: canvasSize.height },
+          });
+        }
 
         const low = 40;
         const high = 50;
@@ -403,8 +471,23 @@ export default {
 
         // 同步数据边界并更新机器人标记位置
         if (robotMarkers && webglRenderer) {
-          robotMarkers.setDataBounds(webglRenderer.dataBounds);
-          robotMarkers.updateAllPositions(webglRenderer.robotManager);
+          const b = webglRenderer.dataBounds;
+          if (
+            !lastDataBounds ||
+            lastDataBounds.minX !== b.minX ||
+            lastDataBounds.minY !== b.minY ||
+            lastDataBounds.maxX !== b.maxX ||
+            lastDataBounds.maxY !== b.maxY ||
+            lastDataBounds.initialized !== b.initialized
+          ) {
+            lastDataBounds = { minX: b.minX, minY: b.minY, maxX: b.maxX, maxY: b.maxY, initialized: b.initialized };
+            robotMarkers.setDataBounds(b);
+          }
+          const nowTs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+          if (!lastMarkersUpdate || nowTs - lastMarkersUpdate >= markersUpdateInterval) {
+            robotMarkers.updateAllPositions(webglRenderer.robotManager);
+            lastMarkersUpdate = nowTs;
+          }
         }
 
         // 更新镜头跟随
@@ -426,14 +509,18 @@ export default {
       isSimulating.value = !isSimulating.value;
 
       if (isSimulating.value) {
-        wsSimulator.updateConfig({
-          interval: wsInterval.value,
-          pointsPerMessage: pointsPerMessage.value,
-          robotCount: robotCount.value,
+        // 更新配置并启动Worker
+        simulatorWorker.postMessage({
+          type: 'config',
+          config: {
+            interval: wsInterval.value,
+            pointsPerMessage: pointsPerMessage.value,
+            robotCount: robotCount.value,
+          }
         });
-        wsSimulator.start();
+        simulatorWorker.postMessage({ type: 'start' });
       } else {
-        wsSimulator.stop();
+        simulatorWorker.postMessage({ type: 'stop' });
       }
     };
 
@@ -441,8 +528,8 @@ export default {
     const clearPoints = () => {
       // 1) 暂停模拟，避免清空过程中不断涌入新点
       const wasRunning = isSimulating.value;
-      if (wasRunning && wsSimulator) {
-        wsSimulator.stop();
+      if (wasRunning && simulatorWorker) {
+        simulatorWorker.postMessage({ type: 'stop' });
         isSimulating.value = false;
       }
 
@@ -460,8 +547,8 @@ export default {
         // 无Worker场景：直接清Konva
         if (robotMarkers) robotMarkers.clear();
         if (pathTracker) pathTracker.latestPoint = null;
-        if (wasRunning && wsSimulator) {
-          wsSimulator.start();
+        if (wasRunning && simulatorWorker) {
+          simulatorWorker.postMessage({ type: 'start' });
           isSimulating.value = true;
         }
       }
@@ -520,7 +607,7 @@ export default {
         canvasSize.width = rect.width;
         canvasSize.height = rect.height;
 
-        console.log('App: 调整Canvas大小', {
+        console.debug('App: 调整Canvas大小', {
           width: canvasSize.width,
           height: canvasSize.height,
         });
@@ -557,19 +644,19 @@ export default {
 
     // 动态监听并应用模拟参数变化
     watch(pointsPerMessage, (val) => {
-      if (wsSimulator) wsSimulator.updateConfig({ pointsPerMessage: val });
+      if (simulatorWorker) simulatorWorker.postMessage({ type: 'config', config: { pointsPerMessage: val } });
     });
     watch(wsInterval, (val) => {
-      if (wsSimulator) wsSimulator.updateConfig({ interval: val });
+      if (simulatorWorker) simulatorWorker.postMessage({ type: 'config', config: { interval: val } });
     });
     watch(robotCount, (val) => {
-      if (wsSimulator) wsSimulator.updateConfig({ robotCount: val });
+      if (simulatorWorker) simulatorWorker.postMessage({ type: 'config', config: { robotCount: val } });
     });
 
     onMounted(() => {
       // 使用nextTick确保DOM完全渲染后再初始化
       setTimeout(() => {
-        console.log('App: 开始初始化');
+        console.debug('App: 开始初始化');
         resizeCanvas();
         initWebGL();
         initKonva();
@@ -582,10 +669,10 @@ export default {
           robotMarkers = new RobotMarkers(konvaLayer);
           // 首次同步一次变换，避免创建后到第一次交互之间的偏差
           robotMarkers.setTransform(viewTransform);
-          console.log('App: 路径跟踪器和机器人标记初始化完成');
+          console.debug('App: 路径跟踪器和机器人标记初始化完成');
         }
 
-        console.log('App: 初始化完成，开始渲染循环');
+        console.debug('App: 初始化完成，开始渲染循环');
         // 开始渲染循环
         animationId = requestAnimationFrame(render);
 
@@ -600,8 +687,8 @@ export default {
         cancelAnimationFrame(animationId);
       }
 
-      if (wsSimulator) {
-        wsSimulator.stop();
+      if (simulatorWorker) {
+        simulatorWorker.terminate();
       }
 
       if (dataWorker) {

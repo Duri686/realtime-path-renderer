@@ -47,7 +47,7 @@ self.onmessage = function(e) {
  */
 function updateConfig(newConfig) {
   config = { ...config, ...newConfig }
-  console.log('Worker config updated:', config)
+  console.debug('Worker config updated:', config)
 }
 
 /**
@@ -114,6 +114,37 @@ function processPoints(rawPoints, transform) {
       reductionRatio: (1 - processedPoints.length / points.length).toFixed(2)
     }
   }, [buffer])
+
+  // 阈值告警：当 Worker 处理单批耗时过高时输出性能告警
+  if (processTime >= 16) {
+    console.warn('[PERF_DEGRADE] WORKER_SLOW_16', {
+      processTime: Number(processTime.toFixed(2)),
+      inputPoints: points.length,
+      outputPoints: processedPoints.length,
+      totalPoints,
+      reductionRatio: Number((1 - processedPoints.length / Math.max(1, points.length)).toFixed(2)),
+      config: {
+        lodThreshold: config.lodThreshold,
+        enableLOD: config.enableLOD,
+        enableCulling: config.enableCulling,
+        maxPoints: config.maxPoints,
+      }
+    })
+  } else if (processTime >= 8) {
+    console.warn('[PERF_DEGRADE] WORKER_SLOW_8', {
+      processTime: Number(processTime.toFixed(2)),
+      inputPoints: points.length,
+      outputPoints: processedPoints.length,
+      totalPoints,
+      reductionRatio: Number((1 - processedPoints.length / Math.max(1, points.length)).toFixed(2)),
+      config: {
+        lodThreshold: config.lodThreshold,
+        enableLOD: config.enableLOD,
+        enableCulling: config.enableCulling,
+        maxPoints: config.maxPoints,
+      }
+    })
+  }
 }
 
 /**
@@ -144,7 +175,7 @@ function parseRawPoints(rawData) {
         points.push({ x, y, r, g, b, a, robotId })
         offset += 28
       }
-      console.log('Worker: 解析点数据', { type: 'Float32Array', format: 'float32x7', pointCount })
+      console.debug('Worker: 解析点数据', { type: 'Float32Array', format: 'float32x7', pointCount })
     } else if (payloadBytes === pointCount * 12) {
       let offset = 4
       for (let i = 0; i < pointCount; i++) {
@@ -157,7 +188,7 @@ function parseRawPoints(rawData) {
         points.push({ x, y, r, g, b, a, robotId: 0 })
         offset += 12
       }
-      console.log('Worker: 解析点数据', { type: 'Float32Array', format: 'legacy-12bytes', pointCount })
+      console.debug('Worker: 解析点数据', { type: 'Float32Array', format: 'legacy-12bytes', pointCount })
     } else {
       const floats = new Float32Array(buffer, 4)
       const n = Math.floor(floats.length / 7)
@@ -173,7 +204,59 @@ function parseRawPoints(rawData) {
           robotId: floats[base + 6]
         })
       }
-      console.warn('Worker: 未知格式，按float32x7推断', { pointCount, payloadBytes })
+      console.debug('Worker: 未知格式，按float32x7推断', { pointCount, payloadBytes })
+    }
+    if (points.length > 0) console.debug('Worker: 第一个点', points[0])
+  }
+  // 直接传入的 ArrayBuffer（兼容处理）
+  else if (rawData instanceof ArrayBuffer) {
+    const buffer = rawData
+    const view = new DataView(buffer)
+    const pointCount = view.getUint32(0, true)
+    const payloadBytes = buffer.byteLength - 4
+    if (payloadBytes === pointCount * 28) {
+      let offset = 4
+      for (let i = 0; i < pointCount; i++) {
+        const x = view.getFloat32(offset, true)
+        const y = view.getFloat32(offset + 4, true)
+        const r = view.getFloat32(offset + 8, true)
+        const g = view.getFloat32(offset + 12, true)
+        const b = view.getFloat32(offset + 16, true)
+        const a = view.getFloat32(offset + 20, true)
+        const robotId = view.getFloat32(offset + 24, true)
+        points.push({ x, y, r, g, b, a, robotId })
+        offset += 28
+      }
+      console.debug('Worker: 解析点数据', { type: 'ArrayBuffer', format: 'float32x7', pointCount })
+    } else if (payloadBytes === pointCount * 12) {
+      let offset = 4
+      for (let i = 0; i < pointCount; i++) {
+        const x = view.getFloat32(offset, true)
+        const y = view.getFloat32(offset + 4, true)
+        const r = view.getUint8(offset + 8) / 255
+        const g = view.getUint8(offset + 9) / 255
+        const b = view.getUint8(offset + 10) / 255
+        const a = view.getUint8(offset + 11) / 255
+        points.push({ x, y, r, g, b, a, robotId: 0 })
+        offset += 12
+      }
+      console.debug('Worker: 解析点数据', { type: 'ArrayBuffer', format: 'legacy-12bytes', pointCount })
+    } else {
+      const floats = new Float32Array(buffer, 4)
+      const n = Math.floor(floats.length / 7)
+      for (let i = 0; i < n; i++) {
+        const base = i * 7
+        points.push({
+          x: floats[base],
+          y: floats[base + 1],
+          r: floats[base + 2],
+          g: floats[base + 3],
+          b: floats[base + 4],
+          a: floats[base + 5],
+          robotId: floats[base + 6]
+        })
+      }
+      console.debug('Worker: 未知格式，按float32x7推断(ArrayBuffer)', { pointCount, payloadBytes })
     }
     if (points.length > 0) console.log('Worker: 第一个点', points[0])
   }

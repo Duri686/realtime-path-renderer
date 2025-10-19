@@ -200,4 +200,15 @@ export class RobotPathManager {
     
     return { minX, minY, maxX, maxY }
   }
+
+  /**
+   * 获取所有机器人的总点数
+   */
+  getTotalPoints() {
+    let total = 0;
+    for (const robot of this.robots.values()) {
+      total += robot.pointCount;
+    }
+    return total;
+  }
 }

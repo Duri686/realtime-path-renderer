@@ -44,6 +44,10 @@ export class RobotMarkers {
       y: 0,
       scale: 1.0
     }
+
+    this._boundsDirty = false
+    this._lastUpdateTime = 0
+    this._updateIntervalMs = 50
   }
   
   /**
@@ -51,7 +55,7 @@ export class RobotMarkers {
    */
   setDataBounds(bounds) {
     this.dataBounds = bounds
-    this.updateAllMarkerPositions()  // 更新所有标记位置
+    this._boundsDirty = true
   }
   
   /**
@@ -265,8 +269,6 @@ export class RobotMarkers {
     if (direction !== undefined) {
       marker.directionArrow.rotation(direction * 180 / Math.PI + 90)
     }
-    
-    this.konvaLayer.overlayLayer.batchDraw()
   }
   
   /**
@@ -295,7 +297,10 @@ export class RobotMarkers {
    */
   updateAllPositions(robotManager) {
     if (!robotManager) return
-    
+    const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()
+    if (now - this._lastUpdateTime < this._updateIntervalMs) return
+    this._lastUpdateTime = now
+
     // 注意：dataBounds 由外部 setDataBounds() 驱动，避免与WebGL不一致
     
     // 更新画布大小
@@ -316,14 +321,23 @@ export class RobotMarkers {
           )
         }
         
-        // 更新位置
         this.updateRobotPosition(
           robot.id,
           robot.currentPosition,
           robot.direction
         )
+
+        const marker = this.markers.get(robot.id)
+        if (marker && marker.startDataPosition) {
+          const startCanvasPos = this.dataToCanvas(marker.startDataPosition.x, marker.startDataPosition.y)
+          marker.startGroup.x(startCanvasPos.x)
+          marker.startGroup.y(startCanvasPos.y)
+        }
       }
     }
+
+    this.konvaLayer.overlayLayer.batchDraw()
+    this._boundsDirty = false
   }
   
   /**

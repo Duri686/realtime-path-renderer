@@ -91,7 +91,7 @@ export class WebGLRenderer {
     this.canvas.height = Math.max(1, Math.round(cssH * dpr))
     gl.viewport(0, 0, this.canvas.width, this.canvas.height)
     
-    console.log('WebGL: 初始化视口', {
+    console.debug('WebGL: 初始化视口', {
       canvasWidth: this.canvas.width,
       canvasHeight: this.canvas.height,
       clientWidth: this.canvas.clientWidth,
@@ -109,7 +109,7 @@ export class WebGLRenderer {
     // 设置清空颜色为深灰色（便于看到绿色的点）
     gl.clearColor(0.1, 0.1, 0.1, 1.0)
     
-    console.log('WebGL: 初始化完成', {
+    console.debug('WebGL: 初始化完成', {
       viewport: [this.canvas.width, this.canvas.height],
       blendEnabled: gl.isEnabled(gl.BLEND)
     })
@@ -298,13 +298,17 @@ export class WebGLRenderer {
    * 更新点数据（从Worker接收处理后的数据）
    */
   updatePoints(data) {
+    if (typeof window !== 'undefined' && window.__PERF_VERBOSE__) console.time('[PERF_DEGRADE] updatePoints');
     const dataView = new DataView(data)
     const pointCount = dataView.getUint32(0, true)
     
     if (this.debug) {
       console.log('WebGL: 接收点数据', { pointCount, bufferSize: data.byteLength })
     }
-    if (pointCount === 0) return
+    if (pointCount === 0) {
+        if (typeof window !== 'undefined' && window.__PERF_VERBOSE__) console.timeEnd('[PERF_DEGRADE] updatePoints');
+        return;
+    }
     
     // 读取点数据（每个点7个float：x, y, r, g, b, a, robotId）
     const pointsData = new Float32Array(data, 4, pointCount * 7)
@@ -354,6 +358,7 @@ export class WebGLRenderer {
     
     // 标记需要重新打包并上传GPU
     this._needsPack = true
+    if (typeof window !== 'undefined' && window.__PERF_VERBOSE__) console.timeEnd('[PERF_DEGRADE] updatePoints');
   }
 
   /**
@@ -378,6 +383,7 @@ export class WebGLRenderer {
    * 将所有机器人的路径打包到连续暂存缓冲，减少到每帧2次上传
    */
   _packRobotsToStaging() {
+    if (typeof window !== 'undefined' && window.__PERF_VERBOSE__) console.time('[PERF_DEGRADE] _packRobotsToStaging');
     const robots = this.robotManager.getActiveRobots()
     this._packedDraws.length = 0
     let total = 0
@@ -412,15 +418,21 @@ export class WebGLRenderer {
     }
     this._packedTotal = write
     this._needsPack = false
+    if (typeof window !== 'undefined' && window.__PERF_VERBOSE__) console.timeEnd('[PERF_DEGRADE] _packRobotsToStaging');
   }
 
   /**
    * 渲染每个机器人的路径
    */
-  renderRobotPaths() {
+  renderRobotPaths(totalPoints = 0) {
+    const logSuffix = ` | totalPoints: ${totalPoints}`;
+    if (typeof window !== 'undefined' && window.__PERF_VERBOSE__) console.time(`[PERF_DEGRADE] renderRobotPaths${logSuffix}`);
     const gl = this.gl
     const robots = this.robotManager.getActiveRobots()
-    if (robots.length === 0 || !this.dataBounds.initialized) return
+    if (robots.length === 0 || !this.dataBounds.initialized) {
+        if (typeof window !== 'undefined' && window.__PERF_VERBOSE__) console.timeEnd(`[PERF_DEGRADE] renderRobotPaths${logSuffix}`);
+        return;
+    }
     
     gl.useProgram(this.program)
     const dpr = Math.max(1, Math.floor(window.devicePixelRatio || 1))
@@ -434,24 +446,32 @@ export class WebGLRenderer {
     gl.bindVertexArray(this.vao)
     if (this._needsPack) { this._packRobotsToStaging(); this._gpuDirty = true }
     if (this._gpuDirty && this._packedTotal > 0) {
+      if (typeof window !== 'undefined' && window.__PERF_VERBOSE__) console.time(`[PERF_DEGRADE] GPU Upload${logSuffix}`);
       gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.position)
       gl.bufferSubData(gl.ARRAY_BUFFER, 0, this._stagingPos.subarray(0, this._packedTotal * 2))
       gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.color)
       gl.bufferSubData(gl.ARRAY_BUFFER, 0, this._stagingColorU8.subarray(0, this._packedTotal * 4))
       this._gpuDirty = false
+      if (typeof window !== 'undefined' && window.__PERF_VERBOSE__) console.timeEnd(`[PERF_DEGRADE] GPU Upload${logSuffix}`);
     }
+    if (typeof window !== 'undefined' && window.__PERF_VERBOSE__) console.time(`[PERF_DEGRADE] Draw Calls${logSuffix}`);
     for (const seg of this._packedDraws) {
       if (seg.count > 1) {
         gl.drawArrays(gl.LINE_STRIP, seg.start, seg.count)
       }
     }
+    if (typeof window !== 'undefined' && window.__PERF_VERBOSE__) console.timeEnd(`[PERF_DEGRADE] Draw Calls${logSuffix}`);
     gl.bindVertexArray(null)
+    if (typeof window !== 'undefined' && window.__PERF_VERBOSE__) console.timeEnd(`[PERF_DEGRADE] renderRobotPaths${logSuffix}`);
   }
   
   /**
    * 渲染一帧
    */
   render() {
+    const totalPoints = this.robotManager ? this.robotManager.getTotalPoints() : 0;
+    const logSuffix = ` | totalPoints: ${totalPoints}`;
+    if (typeof window !== 'undefined' && window.__PERF_VERBOSE__) console.time(`[PERF_DEGRADE] render${logSuffix}`);
     const gl = this.gl
     
     // 清空画布
@@ -460,7 +480,7 @@ export class WebGLRenderer {
     // 渲染机器人路径（如果有）
     const hasRobotPaths = this.robotManager.getActiveRobots().length > 0
     if (hasRobotPaths) {
-      this.renderRobotPaths()
+      this.renderRobotPaths(totalPoints)
     }
     
     // 如果没有机器人路径数据，渲染测试点和环形缓冲区数据
@@ -473,7 +493,7 @@ export class WebGLRenderer {
         this.renderRingBuffer()
       }
     }
-    
+    if (typeof window !== 'undefined' && window.__PERF_VERBOSE__) console.timeEnd(`[PERF_DEGRADE] render${logSuffix}`);
   }
   
   /**
@@ -486,7 +506,7 @@ export class WebGLRenderer {
     if (!this._frameCounter) this._frameCounter = 0
     this._frameCounter++
     if (this._frameCounter % 100 === 0) {
-      console.log('WebGL: 渲染环形缓冲区', {
+      console.debug('WebGL: 渲染环形缓冲区', {
         pointCount: this.ringBuffer.pointCount,
         canvasSize: { width: this.canvas.width, height: this.canvas.height },
         transform: this.transform
@@ -614,7 +634,7 @@ export class WebGLRenderer {
     if (!this._testFrameCounter) this._testFrameCounter = 0
     this._testFrameCounter++
     if (this._testFrameCounter % 100 === 0) {
-      console.log('WebGL: 测试点渲染', {
+      console.debug('WebGL: 测试点渲染', {
         canvasSize: { w: currentWidth, h: currentHeight },
         centerPoint: { x: currentWidth / 2, y: currentHeight / 2 },
         uniforms: {
@@ -649,7 +669,7 @@ export class WebGLRenderer {
 
     if (this.gl) {
       this.gl.viewport(0, 0, dw, dh)
-      console.log('WebGL: Canvas调整大小', { cssWidth: width, cssHeight: height, dpr, drawingBuffer: { w: dw, h: dh } })
+      console.debug('WebGL: Canvas调整大小', { cssWidth: width, cssHeight: height, dpr, drawingBuffer: { w: dw, h: dh } })
     }
   }
   
