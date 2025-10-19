@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGL 路径渲染测试</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: Arial, sans-serif;
+            background: #1a1a1a;
+            color: #fff;
+            display: flex;
+            height: 100vh;
+        }
+        
+        #canvas-container {
+            flex: 1;
+            position: relative;
+        }
+        
+        #webgl-canvas {
+            width: 100%;
+            height: 100%;
+            background: #2a2a2a;
+        }
+        
+        #control-panel {
+            width: 300px;
+            background: #111;
+            padding: 20px;
+            overflow-y: auto;
+        }
+        
+        h3 {
+            margin-bottom: 20px;
+            color: #4CAF50;
+        }
+        
+        .control-group {
+            margin-bottom: 15px;
+        }
+        
+        .control-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 14px;
+        }
+        
+        .control-group input,
+        .control-group select {
+            width: 100%;
+            padding: 5px;
+            background: #333;
+            color: #fff;
+            border: 1px solid #555;
+            border-radius: 3px;
+        }
+        
+        button {
+            width: 100%;
+            padding: 10px;
+            background: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-bottom: 10px;
+        }
+        
+        button:hover {
+            background: #45a049;
+        }
+        
+        button.active {
+            background: #f44336;
+        }
+        
+        #stats {
+            background: #222;
+            padding: 10px;
+            border-radius: 4px;
+            margin-top: 20px;
+        }
+        
+        #stats div {
+            margin: 5px 0;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div id="canvas-container">
+        <canvas id="webgl-canvas"></canvas>
+    </div>
+    
+    <div id="control-panel">
+        <h3>控制面板</h3>
+        
+        <button id="toggleBtn">开始模拟</button>
+        
+        <div class="control-group">
+            <label>发送间隔 (ms):</label>
+            <select id="intervalSelect">
+                <option value="50">50ms</option>
+                <option value="100">100ms</option>
+                <option value="200">200ms</option>
+            </select>
+        </div>
+        
+        <div class="control-group">
+            <label>每批点数:</label>
+            <input type="number" id="batchSize" value="100" min="10" max="1000" step="10">
+        </div>
+        
+        <div class="control-group">
+            <label>点大小:</label>
+            <input type="range" id="pointSize" min="1" max="20" value="4" step="1">
+            <span id="pointSizeValue">4</span>
+        </div>
+        
+        <button id="clearBtn">清空数据</button>
+        
+        <div id="stats">
+            <h4>性能统计</h4>
+            <div>总点数: <span id="totalPoints">0</span></div>
+            <div>FPS: <span id="fps">0</span></div>
+            <div>渲染耗时: <span id="renderTime">0</span>ms</div>
+        </div>
+    </div>
+    
+    <script>
+        // 简化的WebGL渲染器
+        class SimpleWebGLRenderer {
+            constructor(canvas) {
+                this.canvas = canvas
+                this.gl = null
+                this.points = []
+                this.maxPoints = 200000
+                this.pointSize = 4.0
+                
+                this.init()
+            }
+            
+            init() {
+                this.gl = this.canvas.getContext('webgl2', {
+                    alpha: true,
+                    antialias: true,
+                    preserveDrawingBuffer: false
+                })
+                
+                if (!this.gl) {
+                    alert('WebGL2 不支持！')
+                    return
+                }
+                
+                const gl = this.gl
+                
+                // 设置视口
+                this.resize()
+                
+                // 顶点着色器
+                const vsSource = `
+                    attribute vec2 a_position;
+                    uniform vec2 u_resolution;
+                    uniform float u_pointSize;
+                    
+                    void main() {
+                        vec2 clipSpace = ((a_position / u_resolution) * 2.0) - 1.0;
+                        gl_Position = vec4(clipSpace * vec2(1, -1), 0, 1);
+                        gl_PointSize = u_pointSize;
+                    }
+                `
+                
+                // 片段着色器
+                const fsSource = `
+                    precision mediump float;
+                    
+                    void main() {
+                        float dist = length(gl_PointCoord - vec2(0.5));
+                        if (dist > 0.5) discard;
+                        
+                        float alpha = 1.0 - smoothstep(0.4, 0.5, dist);
+                        gl_FragColor = vec4(0.0, 1.0, 0.0, alpha * 0.8);
+                    }
+                `
+                
+                // 创建着色器程序
+                const program = this.createProgram(vsSource, fsSource)
+                this.program = program
+                
+                // 获取属性和uniform位置
+                this.positionLocation = gl.getAttribLocation(program, 'a_position')
+                this.resolutionLocation = gl.getUniformLocation(program, 'u_resolution')
+                this.pointSizeLocation = gl.getUniformLocation(program, 'u_pointSize')
+                
+                // 创建缓冲区
+                this.positionBuffer = gl.createBuffer()
+                
+                // 清空颜色
+                gl.clearColor(0.1, 0.1, 0.1, 1.0)
+                gl.enable(gl.BLEND)
+                gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+            }
+            
+            createProgram(vsSource, fsSource) {
+                const gl = this.gl
+                
+                const vertexShader = this.loadShader(gl.VERTEX_SHADER, vsSource)
+                const fragmentShader = this.loadShader(gl.FRAGMENT_SHADER, fsSource)
+                
+                const program = gl.createProgram()
+                gl.attachShader(program, vertexShader)
+                gl.attachShader(program, fragmentShader)
+                gl.linkProgram(program)
+                
+                if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                    console.error('Unable to initialize the shader program:', gl.getProgramInfoLog(program))
+                    return null
+                }
+                
+                return program
+            }
+            
+            loadShader(type, source) {
+                const gl = this.gl
+                const shader = gl.createShader(type)
+                
+                gl.shaderSource(shader, source)
+                gl.compileShader(shader)
+                
+                if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                    console.error('An error occurred compiling the shaders:', gl.getShaderInfoLog(shader))
+                    gl.deleteShader(shader)
+                    return null
+                }
+                
+                return shader
+            }
+            
+            addPoints(newPoints) {
+                this.points.push(...newPoints)
+                
+                // 限制点数
+                if (this.points.length > this.maxPoints) {
+                    this.points = this.points.slice(-this.maxPoints)
+                }
+            }
+            
+            render() {
+                const gl = this.gl
+                
+                gl.clear(gl.COLOR_BUFFER_BIT)
+                
+                if (this.points.length === 0) return
+                
+                // 创建顶点数组
+                const positions = new Float32Array(this.points.length * 2)
+                for (let i = 0; i < this.points.length; i++) {
+                    positions[i * 2] = this.points[i].x
+                    positions[i * 2 + 1] = this.points[i].y
+                }
+                
+                // 绑定缓冲区并上传数据
+                gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer)
+                gl.bufferData(gl.ARRAY_BUFFER, positions, gl.DYNAMIC_DRAW)
+                
+                // 使用着色器程序
+                gl.useProgram(this.program)
+                
+                // 设置属性
+                gl.enableVertexAttribArray(this.positionLocation)
+                gl.vertexAttribPointer(this.positionLocation, 2, gl.FLOAT, false, 0, 0)
+                
+                // 设置uniforms
+                gl.uniform2f(this.resolutionLocation, this.canvas.width, this.canvas.height)
+                gl.uniform1f(this.pointSizeLocation, this.pointSize)
+                
+                // 绘制
+                gl.drawArrays(gl.POINTS, 0, this.points.length)
+            }
+            
+            clear() {
+                this.points = []
+            }
+            
+            resize() {
+                this.canvas.width = this.canvas.offsetWidth
+                this.canvas.height = this.canvas.offsetHeight
+                
+                if (this.gl) {
+                    this.gl.viewport(0, 0, this.canvas.width, this.canvas.height)
+                }
+            }
+            
+            setPointSize(size) {
+                this.pointSize = size
+            }
+        }
+        
+        // 数据生成器
+        class DataGenerator {
+            constructor() {
+                this.time = 0
+                this.paths = []
+                
+                // 初始化路径
+                for (let i = 0; i < 5; i++) {
+                    this.paths.push({
+                        x: Math.random() * 800 + 100,
+                        y: Math.random() * 400 + 100,
+                        vx: (Math.random() - 0.5) * 5,
+                        vy: (Math.random() - 0.5) * 5,
+                        amplitude: Math.random() * 50 + 20,
+                        frequency: Math.random() * 0.05 + 0.01
+                    })
+                }
+            }
+            
+            generate(count) {
+                const points = []
+                const pointsPerPath = Math.floor(count / this.paths.length)
+                
+                for (const path of this.paths) {
+                    for (let i = 0; i < pointsPerPath; i++) {
+                        path.x += path.vx
+                        path.y += path.vy
+                        
+                        // 边界反弹
+                        if (path.x < 0 || path.x > 1200) path.vx *= -1
+                        if (path.y < 0 || path.y > 600) path.vy *= -1
+                        
+                        // 添加波动
+                        const wave = Math.sin(this.time * path.frequency) * path.amplitude
+                        
+                        points.push({
+                            x: path.x + wave,
+                            y: path.y + Math.cos(this.time * path.frequency * 1.3) * path.amplitude * 0.5
+                        })
+                    }
+                }
+                
+                this.time += 0.1
+                return points
+            }
+        }
+        
+        // 主程序
+        const canvas = document.getElementById('webgl-canvas')
+        const renderer = new SimpleWebGLRenderer(canvas)
+        const generator = new DataGenerator()
+        
+        let isRunning = false
+        let intervalId = null
+        let frameCount = 0
+        let lastFPSUpdate = 0
+        let stats = {
+            totalPoints: 0,
+            fps: 0,
+            renderTime: 0
+        }
+        
+        // 渲染循环
+        function animate() {
+            const startTime = performance.now()
+            
+            renderer.render()
+            
+            stats.renderTime = (performance.now() - startTime).toFixed(2)
+            stats.totalPoints = renderer.points.length
+            
+            // 更新FPS
+            frameCount++
+            const now = Date.now()
+            if (now - lastFPSUpdate >= 1000) {
+                stats.fps = frameCount
+                frameCount = 0
+                lastFPSUpdate = now
+                updateStats()
+            }
+            
+            requestAnimationFrame(animate)
+        }
+        
+        // 开始模拟
+        function startSimulation() {
+            if (isRunning) return
+            
+            isRunning = true
+            document.getElementById('toggleBtn').textContent = '停止模拟'
+            document.getElementById('toggleBtn').classList.add('active')
+            
+            const interval = parseInt(document.getElementById('intervalSelect').value)
+            const batchSize = parseInt(document.getElementById('batchSize').value)
+            
+            intervalId = setInterval(() => {
+                const points = generator.generate(batchSize)
+                renderer.addPoints(points)
+            }, interval)
+        }
+        
+        // 停止模拟
+        function stopSimulation() {
+            if (!isRunning) return
+            
+            isRunning = false
+            document.getElementById('toggleBtn').textContent = '开始模拟'
+            document.getElementById('toggleBtn').classList.remove('active')
+            
+            if (intervalId) {
+                clearInterval(intervalId)
+                intervalId = null
+            }
+        }
+        
+        // 更新统计
+        function updateStats() {
+            document.getElementById('totalPoints').textContent = stats.totalPoints.toLocaleString()
+            document.getElementById('fps').textContent = stats.fps
+            document.getElementById('renderTime').textContent = stats.renderTime
+        }
+        
+        // 事件监听
+        document.getElementById('toggleBtn').addEventListener('click', () => {
+            if (isRunning) {
+                stopSimulation()
+            } else {
+                startSimulation()
+            }
+        })
+        
+        document.getElementById('clearBtn').addEventListener('click', () => {
+            renderer.clear()
+            stats.totalPoints = 0
+            updateStats()
+        })
+        
+        document.getElementById('pointSize').addEventListener('input', (e) => {
+            const size = e.target.value
+            document.getElementById('pointSizeValue').textContent = size
+            renderer.setPointSize(parseFloat(size))
+        })
+        
+        // 窗口大小调整
+        window.addEventListener('resize', () => {
+            renderer.resize()
+        })
+        
+        // 启动渲染循环
+        animate()
+        
+        // 初始统计
+        updateStats()
+        
+        console.log('WebGL路径渲染测试已启动')
+        console.log('点击"开始模拟"按钮开始生成数据')
+    </script>
+</body>
+</html>
