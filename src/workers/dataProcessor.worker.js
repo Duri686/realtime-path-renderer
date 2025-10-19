@@ -316,7 +316,7 @@ function cullPoints(points, viewBounds, transform) {
 }
 
 /**
- * LOD处理 - 根据缩放级别合并临近点
+ * LOD处理 - 根据缩放级别合并临近点（优化版）
  */
 function applyLOD(points, scale) {
   if (points.length < 100 || scale > 0.5) {
@@ -327,63 +327,84 @@ function applyLOD(points, scale) {
   const mergeDistance = config.lodThreshold / scale
   const mergeDistanceSq = mergeDistance * mergeDistance
   
+  // 使用空间分区优化，避免O(n²)复杂度
+  const cellSize = mergeDistance * 2
+  const grid = new Map()
+  
+  // 将点分配到网格
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i]
+    const cellX = Math.floor(p.x / cellSize)
+    const cellY = Math.floor(p.y / cellSize)
+    const key = `${cellX},${cellY}`
+    
+    if (!grid.has(key)) {
+      grid.set(key, [])
+    }
+    grid.get(key).push(i)
+  }
+  
   const lodPoints = []
   const processed = new Set()
   
-  for (let i = 0; i < points.length; i++) {
-    if (processed.has(i)) continue
-    
-    const point = points[i]
-    const cluster = [point]
-    processed.add(i)
-    
-    // 查找邻近点
-    for (let j = i + 1; j < points.length; j++) {
-      if (processed.has(j)) continue
+  // 对每个网格单元进行聚类
+  for (const indices of grid.values()) {
+    for (const i of indices) {
+      if (processed.has(i)) continue
       
-      const other = points[j]
-      const dx = point.x - other.x
-      const dy = point.y - other.y
-      const distSq = dx * dx + dy * dy
+      const point = points[i]
+      const cluster = [point]
+      processed.add(i)
       
-      if (distSq <= mergeDistanceSq) {
-        cluster.push(other)
-        processed.add(j)
-      }
-    }
-    
-    // 计算簇的中心点
-    if (cluster.length > 0) {
-      const avgPoint = {
-        x: 0,
-        y: 0,
-        r: 0,
-        g: 0,
-        b: 0,
-        a: 0
-      }
+      // 只在相邻网格内查找（3x3范围），大幅减少比较次数
+      const cellX = Math.floor(point.x / cellSize)
+      const cellY = Math.floor(point.y / cellSize)
       
-      for (const p of cluster) {
-        avgPoint.x += p.x
-        avgPoint.y += p.y
-        avgPoint.r += p.r
-        avgPoint.g += p.g
-        avgPoint.b += p.b
-        avgPoint.a += p.a
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          const neighborKey = `${cellX + dx},${cellY + dy}`
+          const neighborIndices = grid.get(neighborKey)
+          if (!neighborIndices) continue
+          
+          for (const j of neighborIndices) {
+            if (processed.has(j)) continue
+            
+            const other = points[j]
+            const distSq = (point.x - other.x) ** 2 + (point.y - other.y) ** 2
+            
+            if (distSq <= mergeDistanceSq) {
+              cluster.push(other)
+              processed.add(j)
+            }
+          }
+        }
       }
       
-      const count = cluster.length
-      avgPoint.x /= count
-      avgPoint.y /= count
-      avgPoint.r /= count
-      avgPoint.g /= count
-      avgPoint.b /= count
-      avgPoint.a /= count
-      
-      // 增加透明度表示这是合并后的点
-      avgPoint.a = Math.min(1, avgPoint.a * (1 + Math.log(count) * 0.1))
-      
-      lodPoints.push(avgPoint)
+      // 计算簇的中心点（保留robotId）
+      if (cluster.length > 0) {
+        let sumX = 0, sumY = 0, sumR = 0, sumG = 0, sumB = 0, sumA = 0
+        const robotId = point.robotId || 0
+        
+        for (const p of cluster) {
+          sumX += p.x
+          sumY += p.y
+          sumR += p.r
+          sumG += p.g
+          sumB += p.b
+          sumA += p.a
+        }
+        
+        const count = cluster.length
+        lodPoints.push({
+          x: sumX / count,
+          y: sumY / count,
+          r: sumR / count,
+          g: sumG / count,
+          b: sumB / count,
+          a: Math.min(1, (sumA / count) * (1 + Math.log(count) * 0.1)),
+          robotId
+        })
+      }
     }
   }
   

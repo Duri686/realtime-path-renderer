@@ -100,6 +100,18 @@
         <span>{{ lodThreshold }}px</span>
       </div>
 
+      <div class="control-group">
+        <label>
+          <input
+            type="checkbox"
+            v-model="performanceMode"
+            @change="togglePerformanceMode"
+          />
+          性能模式（禁用动画）
+        </label>
+        <small style="color: #888; font-size: 12px">多机器人场景推荐开启</small>
+      </div>
+
       <div class="stats">
         <h4>性能统计</h4>
         <div>当前点数: {{ stats.totalPoints.toLocaleString() }}</div>
@@ -169,9 +181,17 @@ export default {
     let lastFrameTime = 0;
     let frameCount = 0;
     let fpsUpdateTime = 0;
-    let lastDataBounds = null;
+    // 复用边界对象，避免频繁创建
+    let lastDataBounds = {
+      minX: Infinity,
+      maxX: -Infinity,
+      minY: Infinity,
+      maxY: -Infinity,
+      initialized: false
+    };
     let lastMarkersUpdate = 0;
-    const markersUpdateInterval = 50;
+    const markersUpdateInterval = 200; // 降低标记更新频率（多机器人场景）
+    const trackerUpdateInterval = 100;  // 镜头跟随更新间隔
     // 清空状态控制
     let clearAwaiting = false;
     let resumeAfterClear = false;
@@ -179,10 +199,15 @@ export default {
     let adaptiveLowCount = 0;
     let adaptiveHighCount = 0;
     let currentCulling = false;
+    let lastAdaptiveAdjustTime = 0;
+    const adaptiveAdjustCooldown = 2000; // 2秒冷却，避免频繁调整
 
     // 镜头跟随设置
     const cameraFollow = ref(false); // 是否启用镜头跟随
     const focusedRobotId = ref(0); // 聚焦的机器人ID
+    
+    // 性能模式
+    const performanceMode = ref(false); // 禁用动画以提升性能
 
     // 视图变换矩阵
     const viewTransform = reactive({
@@ -228,10 +253,10 @@ export default {
     const initWorker = () => {
       dataWorker = new DataWorker();
 
-      // 配置Worker（使用顶层字段，匹配 worker 的 updateConfig 期望）
+      // 配置Worker（多机器人场景使用激进LOD策略）
       dataWorker.postMessage({
         type: 'config',
-        lodThreshold: lodThreshold.value,
+        lodThreshold: robotCount.value > 5 ? 3.0 : lodThreshold.value, // 多机器人自动提高阈值
         viewBounds: {
           left: 0,
           top: 0,
@@ -240,7 +265,7 @@ export default {
         },
         maxPoints: 200000,
         enableLOD: true,
-        enableCulling: false,
+        enableCulling: robotCount.value > 5,  // 多机器人强制启用裁剪
       });
 
       // 处理Worker消息
@@ -329,139 +354,79 @@ export default {
       };
     };
 
+    // FPS统计和自适应LOD调整
+    const updatePerformanceStats = (timestamp) => {
+      frameCount++;
+      if (timestamp - fpsUpdateTime < 1000) return;
+      
+      // 更新FPS
+      stats.fps = frameCount;
+      frameCount = 0;
+      fpsUpdateTime = timestamp;
+      
+      // 同步FPS到Konva左上角显示
+      if (konvaLayer) {
+        konvaLayer.updateFPS(stats.fps);
+      }
+      
+      // 记录性能日志
+      statsLog.push({
+        ts: new Date().toISOString(),
+        fps: stats.fps,
+        totalPoints: stats.totalPoints,
+        lastBufferUpdateTime: Number(stats.lastBufferUpdateTime),
+        workerProcessTime: Number(stats.workerProcessTime),
+        renderTime: Number(stats.renderTime),
+        transform: { scale: viewTransform.scale, x: viewTransform.translateX, y: viewTransform.translateY },
+        canvas: { w: canvasSize.width, h: canvasSize.height },
+      });
+      
+      // 自适应LOD调整
+      const low = 40, high = 50;
+      if (stats.fps < low) {
+        adaptiveLowCount++;
+        adaptiveHighCount = 0;
+      } else if (stats.fps > high) {
+        adaptiveHighCount++;
+        adaptiveLowCount = 0;
+      } else {
+        adaptiveLowCount = adaptiveHighCount = 0;
+      }
+      
+      // 冷却期检查
+      const now = performance.now();
+      if (now - lastAdaptiveAdjustTime < adaptiveAdjustCooldown) return;
+      
+      let changed = false;
+      if (adaptiveLowCount >= 3) {
+        const next = Math.min(10, lodThreshold.value + 0.5);
+        if (next !== lodThreshold.value) { lodThreshold.value = next; changed = true; }
+        if (!currentCulling) { currentCulling = true; changed = true; }
+        adaptiveLowCount = 0;
+      } else if (adaptiveHighCount >= 3) {
+        const next = Math.max(1, lodThreshold.value - 0.5);
+        if (next !== lodThreshold.value) { lodThreshold.value = next; changed = true; }
+        if (currentCulling) { currentCulling = false; changed = true; }
+        adaptiveHighCount = 0;
+      }
+      
+      if (changed && dataWorker) {
+        lastAdaptiveAdjustTime = now;
+        dataWorker.postMessage({
+          type: 'config',
+          lodThreshold: lodThreshold.value,
+          enableCulling: currentCulling,
+        });
+      }
+    };
+
     // 渲染循环
     let lastTrackerUpdate = 0;
     const render = (timestamp) => {
       if (!lastFrameTime) lastFrameTime = timestamp;
-      const deltaTime = timestamp - lastFrameTime;
-
-      // 更新FPS
-      frameCount++;
-      if (timestamp - fpsUpdateTime >= 1000) {
-        stats.fps = frameCount;
-        frameCount = 0;
-        fpsUpdateTime = timestamp;
-        statsLog.push({
-          ts: new Date().toISOString(),
-          fps: stats.fps,
-          totalPoints: stats.totalPoints,
-          lastBufferUpdateTime: Number(stats.lastBufferUpdateTime),
-          workerProcessTime: Number(stats.workerProcessTime),
-          renderTime: Number(stats.renderTime),
-          transform: {
-            scale: viewTransform.scale,
-            x: viewTransform.translateX,
-            y: viewTransform.translateY,
-          },
-          canvas: { w: canvasSize.width, h: canvasSize.height },
-        });
-
-        const fpsVal = stats.fps;
-        if (fpsVal <= 25) {
-          console.warn('[PERF_DEGRADE] FPS_LOW_25', {
-            fps: fpsVal,
-            totalPoints: stats.totalPoints,
-            workerProcessTime: Number(stats.workerProcessTime),
-            renderTime: Number(stats.renderTime),
-            lastBufferUpdateTime: Number(stats.lastBufferUpdateTime),
-            lodThreshold: Number(lodThreshold.value),
-            culling: currentCulling,
-            wsInterval: Number(wsInterval.value),
-            pointsPerMessage: Number(pointsPerMessage.value),
-            robotCount: Number(robotCount.value),
-            transform: {
-              scale: viewTransform.scale,
-              x: viewTransform.translateX,
-              y: viewTransform.translateY,
-            },
-            canvas: { w: canvasSize.width, h: canvasSize.height },
-          });
-        } else if (fpsVal < 30) {
-          console.warn('[PERF_DEGRADE] FPS_LOW_30', {
-            fps: fpsVal,
-            totalPoints: stats.totalPoints,
-            workerProcessTime: Number(stats.workerProcessTime),
-            renderTime: Number(stats.renderTime),
-            lastBufferUpdateTime: Number(stats.lastBufferUpdateTime),
-            lodThreshold: Number(lodThreshold.value),
-            culling: currentCulling,
-            wsInterval: Number(wsInterval.value),
-            pointsPerMessage: Number(pointsPerMessage.value),
-            robotCount: Number(robotCount.value),
-            transform: {
-              scale: viewTransform.scale,
-              x: viewTransform.translateX,
-              y: viewTransform.translateY,
-            },
-            canvas: { w: canvasSize.width, h: canvasSize.height },
-          });
-        } else if (fpsVal < 45) {
-          console.warn('[PERF_DEGRADE] FPS_LOW_45', {
-            fps: fpsVal,
-            totalPoints: stats.totalPoints,
-            workerProcessTime: Number(stats.workerProcessTime),
-            renderTime: Number(stats.renderTime),
-            lastBufferUpdateTime: Number(stats.lastBufferUpdateTime),
-            lodThreshold: Number(lodThreshold.value),
-            culling: currentCulling,
-            wsInterval: Number(wsInterval.value),
-            pointsPerMessage: Number(pointsPerMessage.value),
-            robotCount: Number(robotCount.value),
-            transform: {
-              scale: viewTransform.scale,
-              x: viewTransform.translateX,
-              y: viewTransform.translateY,
-            },
-            canvas: { w: canvasSize.width, h: canvasSize.height },
-          });
-        }
-
-        const low = 40;
-        const high = 50;
-        if (stats.fps < low) {
-          adaptiveLowCount++;
-          adaptiveHighCount = 0;
-        } else if (stats.fps > high) {
-          adaptiveHighCount++;
-          adaptiveLowCount = 0;
-        } else {
-          adaptiveLowCount = 0;
-          adaptiveHighCount = 0;
-        }
-
-        let changed = false;
-        if (adaptiveLowCount >= 3) {
-          const next = Math.min(10, Number(lodThreshold.value) + 0.5);
-          if (next !== lodThreshold.value) {
-            lodThreshold.value = next;
-            changed = true;
-          }
-          if (!currentCulling) {
-            currentCulling = true;
-            changed = true;
-          }
-          adaptiveLowCount = 0;
-        } else if (adaptiveHighCount >= 3) {
-          const next = Math.max(1, Number(lodThreshold.value) - 0.5);
-          if (next !== lodThreshold.value) {
-            lodThreshold.value = next;
-            changed = true;
-          }
-          if (currentCulling) {
-            currentCulling = false;
-            changed = true;
-          }
-          adaptiveHighCount = 0;
-        }
-
-        if (changed && dataWorker) {
-          dataWorker.postMessage({
-            type: 'config',
-            lodThreshold: lodThreshold.value,
-            enableCulling: currentCulling,
-          });
-        }
-      }
+      
+      // 性能统计
+      updatePerformanceStats(timestamp);
 
       // 渲染WebGL
       if (webglRenderer) {
@@ -472,15 +437,20 @@ export default {
         // 同步数据边界并更新机器人标记位置
         if (robotMarkers && webglRenderer) {
           const b = webglRenderer.dataBounds;
+          // 避免频繁对象创建，直接比较并复用
           if (
-            !lastDataBounds ||
             lastDataBounds.minX !== b.minX ||
             lastDataBounds.minY !== b.minY ||
             lastDataBounds.maxX !== b.maxX ||
             lastDataBounds.maxY !== b.maxY ||
             lastDataBounds.initialized !== b.initialized
           ) {
-            lastDataBounds = { minX: b.minX, minY: b.minY, maxX: b.maxX, maxY: b.maxY, initialized: b.initialized };
+            // 直接更新现有对象属性，避免创建新对象
+            lastDataBounds.minX = b.minX;
+            lastDataBounds.minY = b.minY;
+            lastDataBounds.maxX = b.maxX;
+            lastDataBounds.maxY = b.maxY;
+            lastDataBounds.initialized = b.initialized;
             robotMarkers.setDataBounds(b);
           }
           const nowTs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
@@ -490,9 +460,9 @@ export default {
           }
         }
 
-        // 更新镜头跟随
+        // 更新镜头跟随（优化：降低更新频率，减少开销）
         if (pathTracker && cameraFollow.value) {
-          if (!lastTrackerUpdate || timestamp - lastTrackerUpdate >= 100) {
+          if (!lastTrackerUpdate || timestamp - lastTrackerUpdate >= trackerUpdateInterval) {
             pathTracker.updateFromRobotManager();
             pathTracker.update();
             lastTrackerUpdate = timestamp;
@@ -599,6 +569,21 @@ export default {
         }
       }
     };
+    
+    // 切换性能模式
+    const togglePerformanceMode = () => {
+      if (robotMarkers) {
+        robotMarkers.animationEnabled = !performanceMode.value;
+        if (!performanceMode.value && robotMarkers.markers.size > 0) {
+          // 重启动画
+          robotMarkers._startGlobalAnimation();
+        } else if (performanceMode.value && robotMarkers.globalAnimation) {
+          // 停止动画
+          robotMarkers.globalAnimation.stop();
+          robotMarkers.globalAnimation = null;
+        }
+      }
+    };
 
     // 调整Canvas大小
     const resizeCanvas = () => {
@@ -666,6 +651,9 @@ export default {
         // 初始化路径跟踪器和机器人标记
         if (webglRenderer && konvaLayer) {
           pathTracker = new PathTracker(konvaLayer, webglRenderer);
+          // 将PathTracker引用传给KonvaLayer，用于交互通知
+          konvaLayer.pathTracker = pathTracker;
+          
           robotMarkers = new RobotMarkers(konvaLayer);
           // 首次同步一次变换，避免创建后到第一次交互之间的偏差
           robotMarkers.setTransform(viewTransform);
@@ -719,11 +707,13 @@ export default {
       stats,
       cameraFollow,
       focusedRobotId,
+      performanceMode,
       toggleSimulation,
       clearPoints,
       exportStats,
       toggleCameraFollow,
       updateFocusedRobot,
+      togglePerformanceMode,
     };
   },
 };
@@ -765,7 +755,11 @@ export default {
   color: #fff;
   padding: 20px;
   overflow-y: auto;
+  overflow-x: hidden;
   border-left: 1px solid #333;
+  /* 移动端平滑滚动 */
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
 }
 
 .control-panel h3 {
@@ -840,5 +834,115 @@ export default {
   margin: 5px 0;
   font-size: 14px;
   color: #aaa;
+}
+
+/* ===== H5移动端适配 ===== */
+@media screen and (max-width: 768px) {
+  .app-container {
+    flex-direction: column;
+  }
+  
+  .canvas-container {
+    height: 60vh;
+    min-height: 300px;
+  }
+  
+  .control-panel {
+    width: 100%;
+    height: 40vh;
+    border-left: none;
+    border-top: 2px solid #333;
+    padding: 15px;
+    max-height: 40vh;
+  }
+  
+  .control-panel h3 {
+    font-size: 16px;
+    margin-bottom: 10px;
+    padding-bottom: 8px;
+  }
+  
+  .control-group {
+    margin-bottom: 10px;
+  }
+  
+  .control-group label {
+    font-size: 13px;
+  }
+  
+  .control-group input[type='number'],
+  .control-group select {
+    padding: 6px;
+    font-size: 14px;
+  }
+  
+  .control-group button {
+    padding: 8px;
+    font-size: 13px;
+  }
+  
+  .stats {
+    padding: 10px;
+    margin: 10px 0;
+  }
+  
+  .stats h4 {
+    font-size: 14px;
+    margin-bottom: 6px;
+  }
+  
+  .stats div {
+    font-size: 12px;
+    margin: 3px 0;
+  }
+  
+  .control-group small {
+    font-size: 11px;
+  }
+}
+
+/* 小屏手机优化 */
+@media screen and (max-width: 480px) {
+  .control-panel {
+    padding: 10px;
+  }
+  
+  .control-panel h3 {
+    font-size: 14px;
+  }
+  
+  .control-group label {
+    font-size: 12px;
+  }
+  
+  .stats {
+    padding: 8px;
+  }
+  
+  .stats h4 {
+    font-size: 13px;
+  }
+  
+  .stats div {
+    font-size: 11px;
+  }
+}
+
+/* 横屏优化 */
+@media screen and (max-width: 768px) and (orientation: landscape) {
+  .app-container {
+    flex-direction: row;
+  }
+  
+  .canvas-container {
+    height: 100vh;
+  }
+  
+  .control-panel {
+    width: 280px;
+    height: 100vh;
+    border-top: none;
+    border-left: 2px solid #333;
+  }
 }
 </style>

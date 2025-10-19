@@ -1,49 +1,36 @@
 /**
- * 路径追踪器 - 自动跟随最新点位置
+ * 路径追踪器 - 镜头跟随控制器
+ * 职责：计算和应用镜头变换，不负责UI渲染
  */
 export class PathTracker {
   constructor(konvaLayer, webglRenderer) {
     this.konvaLayer = konvaLayer
     this.webglRenderer = webglRenderer
-    this.robotManager = webglRenderer ? webglRenderer.robotManager : null
+    this.robotManager = webglRenderer?.robotManager
     
     // 追踪配置
     this.config = {
-      enabled: true,           // 是否启用自动跟踪
+      enabled: false,          // 默认关闭
       smoothing: 0.1,          // 平滑系数 (0-1)
-      margin: 100,             // 边距（像素）
-      updateInterval: 100      // 更新间隔（ms）
+      padding: 0.05            // 数据边距比例
     }
     
     // 当前状态
+    this.focusedRobotId = 0
     this.latestPoint = null
     this.targetTransform = { x: 0, y: 0, scale: 1 }
     this.currentTransform = { x: 0, y: 0, scale: 1 }
     
-    // 机器人标记
-    this.robotMarker = null
-    this.markerBlinkInterval = null
-    
-    // 更新定时器
-    this.updateTimer = null
-
-    // 聚焦的机器人（默认0）
-    this.focusedRobotId = 0
+    // 用户交互状态
+    this.isUserInteracting = false  // 用户正在手动操作
+    this.interactionCooldown = 0    // 交互冷却时间
   }
   
   /**
-   * 启动追踪
+   * 启动追踪（优化：不再使用独立定时器，由主渲染循环驱动）
    */
   start() {
-    if (this.updateTimer) return
-    
-    this.updateTimer = setInterval(() => {
-      this.update()
-    }, this.config.updateInterval)
-    
-    // 启动标记闪烁
-    this.startMarkerBlink()
-    
+    this.config.enabled = true
     console.log('PathTracker: 启动自动跟踪')
   }
   
@@ -51,13 +38,7 @@ export class PathTracker {
    * 停止追踪
    */
   stop() {
-    if (this.updateTimer) {
-      clearInterval(this.updateTimer)
-      this.updateTimer = null
-    }
-    
-    this.stopMarkerBlink()
-    
+    this.config.enabled = false
     console.log('PathTracker: 停止自动跟踪')
   }
   
@@ -79,9 +60,7 @@ export class PathTracker {
     if (this.config.enabled) {
       this.calculateTargetTransform()
     }
-    
-    // 更新机器人标记位置
-    this.updateRobotMarker()
+    // 优化：移除updateRobotMarker()调用，由RobotMarkers统一管理
   }
 
   /**
@@ -102,166 +81,89 @@ export class PathTracker {
     if (this.config.enabled) {
       this.calculateTargetTransform()
     }
-    
-    // 更新机器人标记位置
-    this.updateRobotMarker()
+    // 优化：移除updateRobotMarker()调用，由RobotMarkers统一管理
   }
   
   /**
-   * 计算目标变换
+   * 计算目标变换（将焦点机器人居中）
    */
   calculateTargetTransform() {
-    if (!this.latestPoint) return
+    if (!this.latestPoint || !this.konvaLayer || !this.webglRenderer) return
     
-    const canvasWidth = this.konvaLayer.size.width
-    const canvasHeight = this.konvaLayer.size.height
-    const bounds = this.webglRenderer ? this.webglRenderer.dataBounds : { minX: 0, minY: 0, maxX: canvasWidth, maxY: canvasHeight }
-    const pad = 0.05
-    const rx = Math.max(1e-6, bounds.maxX - bounds.minX)
-    const ry = Math.max(1e-6, bounds.maxY - bounds.minY)
-    const nx = (this.latestPoint.x - bounds.minX) / rx
-    const ny = (this.latestPoint.y - bounds.minY) / ry
-    const px = (nx * (1 - 2 * pad) + pad) * canvasWidth
-    const py = (ny * (1 - 2 * pad) + pad) * canvasHeight
+    const { width, height } = this.konvaLayer.size
+    const bounds = this.webglRenderer.dataBounds
+    
+    // 数据坐标转画布坐标（与WebGL着色器一致）
+    const pad = this.config.padding
+    const rangeX = Math.max(1e-6, bounds.maxX - bounds.minX)
+    const rangeY = Math.max(1e-6, bounds.maxY - bounds.minY)
+    
+    const nx = (this.latestPoint.x - bounds.minX) / rangeX
+    const ny = (this.latestPoint.y - bounds.minY) / rangeY
+    
+    const canvasX = (nx * (1 - 2 * pad) + pad) * width
+    const canvasY = (ny * (1 - 2 * pad) + pad) * height
+    
+    // 计算变换使目标点居中
     const scale = this.currentTransform.scale
-    // 使 (px + tx) * scale = canvas/2  => tx = canvas/(2*scale) - px
     this.targetTransform = {
-      x: canvasWidth / (2 * scale) - px,
-      y: canvasHeight / (2 * scale) - py,
+      x: width / (2 * scale) - canvasX,
+      y: height / (2 * scale) - canvasY,
       scale
     }
   }
   
   /**
-   * 平滑更新视图变换
+   * 通知用户开始手动交互（暂停自动跟踪）
+   */
+  notifyUserInteractionStart() {
+    this.isUserInteracting = true
+    this.interactionCooldown = Date.now() + 2000 // 2秒冷却
+    console.log('PathTracker: 用户手动操作，暂停自动跟踪')
+  }
+  
+  /**
+   * 通知用户结束手动交互
+   */
+  notifyUserInteractionEnd() {
+    this.isUserInteracting = false
+    console.log('PathTracker: 用户操作结束')
+  }
+  
+  /**
+   * 平滑更新视图变换（线性插值）
    */
   update() {
-    if (!this.config.enabled || !this.latestPoint) return
+    if (!this.config.enabled || !this.latestPoint || !this.konvaLayer) return
+    
+    // 用户正在交互或冷却期内，暂停自动跟踪
+    if (this.isUserInteracting || Date.now() < this.interactionCooldown) {
+      return
+    }
     
     // 线性插值平滑移动
-    const smoothing = this.config.smoothing
+    const { smoothing } = this.config
+    const { x, y, scale } = this.currentTransform
+    const target = this.targetTransform
     
-    this.currentTransform.x += (this.targetTransform.x - this.currentTransform.x) * smoothing
-    this.currentTransform.y += (this.targetTransform.y - this.currentTransform.y) * smoothing
-    this.currentTransform.scale += (this.targetTransform.scale - this.currentTransform.scale) * smoothing
+    this.currentTransform.x = x + (target.x - x) * smoothing
+    this.currentTransform.y = y + (target.y - y) * smoothing
+    this.currentTransform.scale = scale + (target.scale - scale) * smoothing
     
-    // 应用到Konva层（会自动同步到WebGL）
-    if (this.konvaLayer && this.konvaLayer.stage) {
-      // 这里需要实现Konva的transform更新
-      // 暂时通过直接设置来实现
-      this.konvaLayer.transform.x = this.currentTransform.x
-      this.konvaLayer.transform.y = this.currentTransform.y
-      this.konvaLayer.transform.scale = this.currentTransform.scale
-      
-      // 触发变换回调
-      if (this.konvaLayer.onTransformChangeCallback) {
-        this.konvaLayer.onTransformChangeCallback(this.currentTransform)
-      }
-      
-      // 重绘网格
-      this.konvaLayer.drawGrid()
-    }
+    // 应用变换（通过KonvaLayer统一管理）
+    this.applyTransform()
   }
   
   /**
-   * 更新机器人标记
+   * 应用变换到Konva层
    */
-  updateRobotMarker() {
-    if (!this.latestPoint || !this.konvaLayer) return
+  applyTransform() {
+    if (!this.konvaLayer?.stage) return
     
-    // 如果标记不存在，创建它
-    if (!this.robotMarker) {
-      this.createRobotMarker()
-    }
+    Object.assign(this.konvaLayer.transform, this.currentTransform)
     
-    // 更新标记位置（使用与WebGL一致的映射）
-    const canvasWidth = this.konvaLayer.size.width
-    const canvasHeight = this.konvaLayer.size.height
-    const bounds = this.webglRenderer ? this.webglRenderer.dataBounds : { minX: 0, minY: 0, maxX: canvasWidth, maxY: canvasHeight }
-    const pad = 0.05
-    const rx = Math.max(1e-6, bounds.maxX - bounds.minX)
-    const ry = Math.max(1e-6, bounds.maxY - bounds.minY)
-    const nx = (this.latestPoint.x - bounds.minX) / rx
-    const ny = (this.latestPoint.y - bounds.minY) / ry
-    const px = (nx * (1 - 2 * pad) + pad) * canvasWidth
-    const py = (ny * (1 - 2 * pad) + pad) * canvasHeight
-    const transform = this.currentTransform
-    const screenX = (px + transform.x) * transform.scale
-    const screenY = (py + transform.y) * transform.scale
-    
-    if (this.robotMarker) {
-      this.robotMarker.position({
-        x: screenX,
-        y: screenY
-      })
-      this.konvaLayer.overlayLayer.draw()
-    }
-  }
-  
-  /**
-   * 创建机器人标记
-   */
-  createRobotMarker() {
-    if (!this.konvaLayer) return
-    
-    const KonvaNS = (this.konvaLayer && this.konvaLayer.overlayLayer && this.konvaLayer.overlayLayer.constructor && this.konvaLayer.overlayLayer.constructor.parent) || window.Konva
-    if (!KonvaNS) return
-    // 创建一个闪烁的圆形标记
-    this.robotMarker = new KonvaNS.Circle({
-      x: 0,
-      y: 0,
-      radius: 8,
-      fill: '#ff0000',
-      stroke: '#ffffff',
-      strokeWidth: 2,
-      opacity: 1
-    })
-    
-    this.konvaLayer.overlayLayer.add(this.robotMarker)
-    this.konvaLayer.overlayLayer.draw()
-  }
-  
-  /**
-   * 启动标记闪烁动画
-   */
-  startMarkerBlink() {
-    if (this.markerBlinkInterval) return
-    
-    let opacity = 1
-    let direction = -1
-    
-    this.markerBlinkInterval = setInterval(() => {
-      if (!this.robotMarker) return
-      
-      opacity += direction * 0.1
-      
-      if (opacity <= 0.3) {
-        opacity = 0.3
-        direction = 1
-      } else if (opacity >= 1) {
-        opacity = 1
-        direction = -1
-      }
-      
-      this.robotMarker.opacity(opacity)
-      this.konvaLayer.overlayLayer.draw()
-    }, 50)
-  }
-  
-  /**
-   * 停止标记闪烁
-   */
-  stopMarkerBlink() {
-    if (this.markerBlinkInterval) {
-      clearInterval(this.markerBlinkInterval)
-      this.markerBlinkInterval = null
-    }
-    
-    if (this.robotMarker) {
-      this.robotMarker.destroy()
-      this.robotMarker = null
-      this.konvaLayer.overlayLayer.draw()
-    }
+    // 触发变换回调（同步到WebGL和RobotMarkers）
+    this.konvaLayer.onTransformChangeCallback?.(this.currentTransform)
   }
   
   /**
@@ -269,30 +171,17 @@ export class PathTracker {
    */
   toggle() {
     this.config.enabled = !this.config.enabled
-    
     if (this.config.enabled) {
       this.calculateTargetTransform()
     }
-    
     return this.config.enabled
   }
   
   /**
-   * 设置配置
-   */
-  setConfig(config) {
-    this.config = { ...this.config, ...config }
-  }
-  
-  /**
-   * 销毁
+   * 销毁（清理资源）
    */
   destroy() {
     this.stop()
-    
-    if (this.robotMarker) {
-      this.robotMarker.destroy()
-      this.robotMarker = null
-    }
+    this.latestPoint = null
   }
 }

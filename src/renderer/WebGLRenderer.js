@@ -1,16 +1,30 @@
 import { RobotPathManager } from './RobotPathManager.js'
+import { ShaderCompiler } from './shaders/ShaderCompiler.js'
+import { PathShader } from './shaders/PathShader.js'
+import { MarkerShader } from './shaders/MarkerShader.js'
+
+// WebGL渲染常量
+const RENDER_CONFIG = {
+  MAX_POINTS: 120000,          // GPU缓冲区预算
+  MAX_ROBOTS: 10,              // 最大机器人数
+  ROBOT_BUFFER_SIZE: 50000,    // 单机器人缓冲
+  POINT_SIZE: 5.0,             // 点大小
+  LINE_WIDTH: 2.5,             // 线宽
+  DATA_PADDING: 0.05,          // 数据边距比例
+  CLEAR_COLOR: [0.1, 0.1, 0.1, 1.0], // 背景色
+}
 
 /**
- * WebGL渲染器 - 负责高性能路径渲染
- * 使用环形缓冲区和增量更新优化
+ * WebGL渲染器 - 高性能路径渲染
+ * 职责：WebGL上下文管理、着色器、缓冲区、渲染循环
  */
 export class WebGLRenderer {
   constructor(canvas) {
     this.canvas = canvas
     this.gl = null
     
-    // 最大点数（预分配缓冲区大小，GPU预算阈值）
-    this.MAX_POINTS = 120000
+    // 配置（可外部覆盖）
+    this.MAX_POINTS = RENDER_CONFIG.MAX_POINTS
     
     // 机器人路径管理器
     this.robotManager = new RobotPathManager(10, 50000)
@@ -51,18 +65,25 @@ export class WebGLRenderer {
     }
     
     // 渲染配置
-    this.pointSize = 5.0  // 点的大小
-    this.lineWidth = 2.5
-    this.renderMode = 'lines' // 连续线条模式
+    this.pointSize = RENDER_CONFIG.POINT_SIZE
+    this.lineWidth = RENDER_CONFIG.LINE_WIDTH
+    this.renderMode = 'lines'
 
-    // 调试与打包状态
-    this.debug = false
-    this._needsPack = false
+    // 性能状态
     this._stagingPos = new Float32Array(this.MAX_POINTS * 2)
     this._stagingColorU8 = new Uint8Array(this.MAX_POINTS * 4)
-    this._packedDraws = [] // {start, count} per robot
+    this._packedDraws = []
     this._packedTotal = 0
+    this._needsPack = false
     this._gpuDirty = false
+    
+    // 机器人标记渲染（WebGL）
+    this.markerProgram = null
+    this.markerBuffer = null
+    this.markerVAO = null
+    // 每个机器人2个标记（起点+当前） × 7float (x,y,r,g,b,a,size)
+    this.markerData = new Float32Array(10 * 2 * 7)
+    this.markerCount = 0
   }
   
   /**
@@ -106,8 +127,9 @@ export class WebGLRenderer {
     // 设置线宽（注意：WebGL2可能不支持大于1的线宽）
     gl.lineWidth(this.lineWidth)
     
-    // 设置清空颜色为深灰色（便于看到绿色的点）
-    gl.clearColor(0.1, 0.1, 0.1, 1.0)
+    // 设置清空颜色
+    const [r, g, b, a] = RENDER_CONFIG.CLEAR_COLOR
+    gl.clearColor(r, g, b, a)
     
     console.debug('WebGL: 初始化完成', {
       viewport: [this.canvas.width, this.canvas.height],
@@ -116,123 +138,72 @@ export class WebGLRenderer {
     
     // 初始化着色器程序
     this.initShaders()
+    this.initMarkerShaders()
     
     // 初始化缓冲区
     this.initBuffers()
+    this.initMarkerBuffers()
     
     // 初始化环形缓冲区数据
     this.initRingBuffer()
   }
   
   /**
-   * 初始化着色器
+   * 初始化路径渲染着色器
    */
   initShaders() {
     const gl = this.gl
     
-    // 顶点着色器源码
-    const vertexShaderSource = `#version 300 es
-      precision highp float;
-      
-      // 顶点属性
-      in vec2 a_position;  // 世界坐标
-      in vec4 a_color;     // 顶点颜色
-      
-      // 统一变量
-      uniform vec2 u_resolution;     // 画布分辨率
-      uniform vec2 u_dataMin;        // 数据最小边界
-      uniform vec2 u_dataMax;        // 数据最大边界
-      uniform vec2 u_viewTranslate;  // 视图平移
-      uniform float u_viewScale;     // 视图缩放
-      uniform float u_pointSize;
-      
-      // 输出到片段着色器
-      out vec4 v_color;
-      
-      void main() {
-        // 1) 归一化到[0,1]
-        vec2 dataRange = u_dataMax - u_dataMin;
-        dataRange = max(dataRange, vec2(1e-6));
-        vec2 normalizedPos = (a_position - u_dataMin) / dataRange;
-        // 2) padding
-        float padding = 0.05;
-        vec2 paddedPos = normalizedPos * (1.0 - 2.0 * padding) + padding;
-        // 3) 应用视图变换（在像素空间）
-        vec2 canvasPos = paddedPos * u_resolution;
-        vec2 transformedPos = (canvasPos + u_viewTranslate) * u_viewScale;
-        // 4) 转裁剪坐标
-        vec2 clipSpace = (transformedPos / u_resolution) * 2.0 - 1.0;
-        clipSpace.y *= -1.0;
-        gl_Position = vec4(clipSpace, 0.0, 1.0);
-        gl_PointSize = u_pointSize * u_viewScale;
-        v_color = a_color;
-      }
-    `
-    
-    // 片段着色器源码
-    const fragmentShaderSource = `#version 300 es
-      precision highp float;
-      
-      // 从顶点着色器接收
-      in vec4 v_color;
-      
-      // 输出颜色
-      out vec4 fragColor;
-      
-      void main() {
-        // 圆形点渲染（使用点精灵）
-        if (length(gl_PointCoord - vec2(0.5)) > 0.5) {
-          discard;
-        }
-        
-        fragColor = v_color;
-      }
-    `
-    
-    // 编译着色器
-    const vertexShader = this.compileShader(gl.VERTEX_SHADER, vertexShaderSource)
-    const fragmentShader = this.compileShader(gl.FRAGMENT_SHADER, fragmentShaderSource)
-    
-    // 创建着色器程序
-    this.program = gl.createProgram()
-    gl.attachShader(this.program, vertexShader)
-    gl.attachShader(this.program, fragmentShader)
-    gl.linkProgram(this.program)
-    
-    if (!gl.getProgramParameter(this.program, gl.LINK_STATUS)) {
-      throw new Error('Failed to link shader program: ' + gl.getProgramInfoLog(this.program))
-    }
+    // 使用模块化着色器
+    this.program = ShaderCompiler.createProgramFromSource(
+      gl,
+      PathShader.getVertexSource(),
+      PathShader.getFragmentSource()
+    )
     
     // 获取attribute和uniform位置
-    this.attributes = {
-      position: gl.getAttribLocation(this.program, 'a_position'),
-      color: gl.getAttribLocation(this.program, 'a_color')
-    }
+    this.attributes = ShaderCompiler.getAttributeLocations(
+      gl,
+      this.program,
+      PathShader.getAttributeNames()
+    )
     
-    this.uniforms = {
-      resolution: gl.getUniformLocation(this.program, 'u_resolution'),
-      dataMin: gl.getUniformLocation(this.program, 'u_dataMin'),
-      dataMax: gl.getUniformLocation(this.program, 'u_dataMax'),
-      viewTranslate: gl.getUniformLocation(this.program, 'u_viewTranslate'),
-      viewScale: gl.getUniformLocation(this.program, 'u_viewScale'),
-      pointSize: gl.getUniformLocation(this.program, 'u_pointSize')
-    }
+    this.uniforms = ShaderCompiler.getUniformLocations(
+      gl,
+      this.program,
+      PathShader.getUniformNames()
+    )
+    
+    console.log('WebGL: 路径着色器初始化完成')
   }
   
   /**
-   * 编译单个着色器
+   * 初始化机器人标记着色器（呼吸灯效果）
    */
-  compileShader(type, source) {
+  initMarkerShaders() {
     const gl = this.gl
-    const shader = gl.createShader(type)
-    gl.shaderSource(shader, source)
-    gl.compileShader(shader)
     
-    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-      throw new Error('Shader compilation failed: ' + gl.getShaderInfoLog(shader))
-    }
+    // 使用模块化着色器
+    this.markerProgram = ShaderCompiler.createProgramFromSource(
+      gl,
+      MarkerShader.getVertexSource(),
+      MarkerShader.getFragmentSource()
+    )
     
-    return shader
+    // 获取attribute和uniform位置
+    this.markerAttributes = ShaderCompiler.getAttributeLocations(
+      gl,
+      this.markerProgram,
+      MarkerShader.getAttributeNames()
+    )
+    
+    this.markerUniforms = ShaderCompiler.getUniformLocations(
+      gl,
+      this.markerProgram,
+      MarkerShader.getUniformNames()
+    )
+    
+    console.log('WebGL: 标记着色器初始化完成')
   }
   
   /**
@@ -265,6 +236,41 @@ export class WebGLRenderer {
     gl.vertexAttribPointer(this.attributes.color, 4, gl.UNSIGNED_BYTE, true, 0, 0)
     
     gl.bindVertexArray(null)
+  }
+  
+  /**
+   * 初始化标记缓冲区
+   */
+  initMarkerBuffers() {
+    const gl = this.gl
+    
+    // 创建标记缓冲区（10机器人 × 2标记 × 7float）
+    this.markerBuffer = gl.createBuffer()
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.markerBuffer)
+    gl.bufferData(gl.ARRAY_BUFFER, this.markerData, gl.DYNAMIC_DRAW)
+    
+    // 创建标记VAO
+    this.markerVAO = gl.createVertexArray()
+    gl.bindVertexArray(this.markerVAO)
+    
+    // 设置标记属性（stride=28字节：7个float）
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.markerBuffer)
+    
+    // a_position (vec2) - offset 0
+    gl.enableVertexAttribArray(this.markerAttributes.position)
+    gl.vertexAttribPointer(this.markerAttributes.position, 2, gl.FLOAT, false, 28, 0)
+    
+    // a_color (vec4) - offset 8
+    gl.enableVertexAttribArray(this.markerAttributes.color)
+    gl.vertexAttribPointer(this.markerAttributes.color, 4, gl.FLOAT, false, 28, 8)
+    
+    // a_size (float) - offset 24
+    gl.enableVertexAttribArray(this.markerAttributes.size)
+    gl.vertexAttribPointer(this.markerAttributes.size, 1, gl.FLOAT, false, 28, 24)
+    
+    gl.bindVertexArray(null)
+    
+    console.log('WebGL: 标记缓冲区初始化完成（支持起点+当前）')
   }
   
   /**
@@ -466,6 +472,79 @@ export class WebGLRenderer {
   }
   
   /**
+   * 更新机器人标记数据（起点+当前位置）
+   */
+  updateMarkers() {
+    if (!this.robotManager) return
+    
+    const robots = this.robotManager.getActiveRobots()
+    this.markerCount = 0
+    
+    for (const robot of robots) {
+      const startPos = robot.startPosition
+      const currentPos = robot.currentPosition
+      if (!currentPos) continue
+      
+      // 起点标记（固定小圆点）
+      if (startPos) {
+        const idx = this.markerCount * 7
+        this.markerData[idx] = startPos.x
+        this.markerData[idx + 1] = startPos.y
+        this.markerData[idx + 2] = robot.color[0]
+        this.markerData[idx + 3] = robot.color[1]
+        this.markerData[idx + 4] = robot.color[2]
+        this.markerData[idx + 5] = 0.8  // alpha
+        this.markerData[idx + 6] = 8.0  // size (小)
+        this.markerCount++
+      }
+      
+      // 当前位置标记（呼吸灯）
+      const idx = this.markerCount * 7
+      this.markerData[idx] = currentPos.x
+      this.markerData[idx + 1] = currentPos.y
+      this.markerData[idx + 2] = robot.color[0]
+      this.markerData[idx + 3] = robot.color[1]
+      this.markerData[idx + 4] = robot.color[2]
+      this.markerData[idx + 5] = 1.0  // alpha
+      this.markerData[idx + 6] = 12.0  // size (大，触发呼吸灯)
+      this.markerCount++
+    }
+    
+    // 上传到GPU
+    if (this.markerCount > 0) {
+      const gl = this.gl
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.markerBuffer)
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, this.markerData, 0, this.markerCount * 7)
+    }
+  }
+  
+  /**
+   * 渲染机器人标记（WebGL点精灵 + 呼吸灯）
+   */
+  renderMarkers(time = 0) {
+    if (this.markerCount === 0 || !this.markerProgram) return
+    
+    const gl = this.gl
+    
+    // 使用标记着色器
+    gl.useProgram(this.markerProgram)
+    gl.bindVertexArray(this.markerVAO)
+    
+    // 设置uniforms
+    gl.uniform2f(this.markerUniforms.resolution, this.canvas.width, this.canvas.height)
+    gl.uniform2f(this.markerUniforms.dataMin, this.dataBounds.minX, this.dataBounds.minY)
+    gl.uniform2f(this.markerUniforms.dataMax, this.dataBounds.maxX, this.dataBounds.maxY)
+    gl.uniform2f(this.markerUniforms.viewTranslate, this.transform.translateX, this.transform.translateY)
+    gl.uniform1f(this.markerUniforms.viewScale, this.transform.scale)
+    gl.uniform1f(this.markerUniforms.time, time)
+    
+    // 绘制点精灵
+    gl.drawArrays(gl.POINTS, 0, this.markerCount)
+    
+    gl.bindVertexArray(null)
+  }
+  
+  /**
    * 渲染一帧
    */
   render() {
@@ -481,6 +560,10 @@ export class WebGLRenderer {
     const hasRobotPaths = this.robotManager.getActiveRobots().length > 0
     if (hasRobotPaths) {
       this.renderRobotPaths(totalPoints)
+      
+      // 更新并渲染机器人标记（WebGL呼吸灯）
+      this.updateMarkers()
+      this.renderMarkers(performance.now())
     }
     
     // 如果没有机器人路径数据，渲染测试点和环形缓冲区数据

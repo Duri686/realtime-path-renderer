@@ -31,10 +31,15 @@ export class KonvaLayer {
     
     // 回调函数
     this.onTransformChangeCallback = null
+    this.pathTracker = null  // PathTracker引用（用于通知交互）
     
     // 交互状态
     this.isPanning = false
     this.lastPointerPosition = null
+    
+    // 性能优化：drawGrid节流
+    this.lastGridDrawTime = 0
+    this.gridDrawThrottle = 100 // 100ms内最多绘制一次网格
     
     this.init()
   }
@@ -85,10 +90,17 @@ export class KonvaLayer {
   }
   
   /**
-   * 绘制网格
+   * 绘制网格（带节流优化）
    */
-  drawGrid() {
+  drawGrid(force = false) {
     if (!this.gridConfig.enabled) return
+    
+    // 节流：避免频繁重绘
+    const now = performance.now()
+    if (!force && now - this.lastGridDrawTime < this.gridDrawThrottle) {
+      return
+    }
+    this.lastGridDrawTime = now
     
     this.gridLayer.destroyChildren()
     
@@ -151,6 +163,19 @@ export class KonvaLayer {
       shadowOpacity: 0.7
     })
     
+    // FPS显示
+    this.fpsText = new Konva.Text({
+      x: 10,
+      y: 50,
+      text: 'FPS: 0',
+      fontSize: 14,
+      fontFamily: 'monospace',
+      fill: '#00ff00',
+      shadowColor: 'black',
+      shadowBlur: 5,
+      shadowOpacity: 0.7
+    })
+    
     // 中心十字准星
     this.crosshair = new Konva.Group({
       x: this.size.width / 2,
@@ -196,9 +221,22 @@ export class KonvaLayer {
     // 添加到覆盖层
     this.overlayLayer.add(this.coordinateText)
     this.overlayLayer.add(this.zoomText)
+    this.overlayLayer.add(this.fpsText)
     this.overlayLayer.add(this.crosshair)
     this.overlayLayer.add(this.minimap)
     this.overlayLayer.draw()
+  }
+  
+  /**
+   * 更新FPS显示
+   */
+  updateFPS(fps) {
+    if (this.fpsText) {
+      // 根据FPS值设置颜色（绿色=好，黄色=中等，红色=差）
+      const color = fps >= 50 ? '#00ff00' : fps >= 30 ? '#ffff00' : '#ff0000'
+      this.fpsText.fill(color)
+      this.fpsText.text(`FPS: ${fps}`)
+    }
   }
   
   /**
@@ -210,6 +248,9 @@ export class KonvaLayer {
     // 鼠标滚轮缩放
     stage.on('wheel', (e) => {
       e.evt.preventDefault()
+      
+      // 通知PathTracker用户正在交互
+      this.pathTracker?.notifyUserInteractionStart()
       
       const oldScale = this.transform.scale
       const pointer = stage.getPointerPosition()
@@ -239,6 +280,9 @@ export class KonvaLayer {
         this.isPanning = true
         this.lastPointerPosition = stage.getPointerPosition()
         stage.container().style.cursor = 'grabbing'
+        
+        // 通知PathTracker用户正在交互
+        this.pathTracker?.notifyUserInteractionStart()
       }
     })
     
@@ -276,6 +320,45 @@ export class KonvaLayer {
       stage.container().style.cursor = 'default'
     })
     
+    // H5触摸事件支持（移动端）
+    stage.on('touchstart', (e) => {
+      e.evt.preventDefault()
+      const touch = e.evt.touches[0]
+      this.isPanning = true
+      this.lastPointerPosition = { x: touch.clientX, y: touch.clientY }
+      
+      // 通知PathTracker用户正在交互
+      this.pathTracker?.notifyUserInteractionStart()
+    })
+    
+    stage.on('touchmove', (e) => {
+      e.evt.preventDefault()
+      const touch = e.evt.touches[0]
+      const pointer = { x: touch.clientX, y: touch.clientY }
+      
+      // 处理拖拽
+      if (this.isPanning && this.lastPointerPosition) {
+        const dx = pointer.x - this.lastPointerPosition.x
+        const dy = pointer.y - this.lastPointerPosition.y
+        
+        this.transform.x += dx
+        this.transform.y += dy
+        
+        this.lastPointerPosition = pointer
+        this.updateTransform()
+      }
+    })
+    
+    stage.on('touchend', () => {
+      this.isPanning = false
+      this.lastPointerPosition = null
+    })
+    
+    stage.on('touchcancel', () => {
+      this.isPanning = false
+      this.lastPointerPosition = null
+    })
+    
     // 初始鼠标样式
     stage.container().style.cursor = 'grab'
     
@@ -285,7 +368,7 @@ export class KonvaLayer {
         case 'g':
         case 'G':
           this.gridConfig.enabled = !this.gridConfig.enabled
-          this.drawGrid()
+          this.drawGrid(true) // 强制绘制
           break
         case 'c':
         case 'C':
@@ -378,8 +461,8 @@ export class KonvaLayer {
       this.backgroundLayer.destroyChildren()
       this.initBackground()
       
-      // 更新网格
-      this.drawGrid()
+      // 更新网格（强制立即绘制）
+      this.drawGrid(true)
       
       // 更新十字准星位置
       this.crosshair.x(width / 2)

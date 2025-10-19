@@ -1,28 +1,36 @@
+// 标记样式配置
+const MARKER_CONFIG = {
+  START: {
+    radius: 8,
+    strokeWidth: 2,
+    opacity: 0.8
+  },
+  CURRENT: {
+    radius: 10,
+    strokeWidth: 3,
+    pulseRadius: 20,
+    pulseOpacity: 0.3,
+    animationInterval: 50  // 20fps动画
+  },
+  UPDATE_INTERVAL: 200,  // 位置更新间隔（降至200ms，减少开销）
+  DATA_PADDING: 0.05     // 与WebGL一致
+}
+
 /**
- * 机器人标记管理器 - 管理起点标记和当前位置标记
+ * 机器人标记管理器
+ * 职责：管理机器人UI标记、动画、坐标转换
  */
 export class RobotMarkers {
   constructor(konvaLayer) {
     this.konvaLayer = konvaLayer
-    this.markers = new Map()  // robotId -> markers
+    this.markers = new Map()
     
-    // 标记样式配置
-    this.config = {
-      startMarker: {
-        radius: 8,
-        strokeWidth: 2,
-        opacity: 0.8
-      },
-      currentMarker: {
-        radius: 10,
-        strokeWidth: 3,
-        pulseRadius: 20,
-        pulseOpacity: 0.3
-      }
-    }
+    // 全局动画管理器（所有机器人共享一个RAF循环）
+    this.globalAnimation = null
+    this.animationEnabled = true
     
-    // 动画状态
-    this.animations = new Map()
+    // WebGL标记模式（true=WebGL渲染，false=Konva渲染）
+    this.useWebGLMarkers = true
     
     // 数据边界（与WebGL同步）
     this.dataBounds = {
@@ -45,9 +53,10 @@ export class RobotMarkers {
       scale: 1.0
     }
 
+    // 性能优化标志
     this._boundsDirty = false
     this._lastUpdateTime = 0
-    this._updateIntervalMs = 50
+    this._updateIntervalMs = MARKER_CONFIG.UPDATE_INTERVAL
   }
   
   /**
@@ -79,24 +88,29 @@ export class RobotMarkers {
   }
   
   /**
-   * 将数据坐标转换为画布坐标（与WebGL着色器逻辑一致）
+   * 数据坐标转换为画布坐标（与WebGL着色器一致）
    */
   dataToCanvas(dataX, dataY) {
-    // 1) 按数据边界归一化到 [0,1]
-    let rangeX = this.dataBounds.maxX - this.dataBounds.minX
-    let rangeY = this.dataBounds.maxY - this.dataBounds.minY
-    if (rangeX <= 1e-6) rangeX = 1e-6
-    if (rangeY <= 1e-6) rangeY = 1e-6
-    const nx = (dataX - this.dataBounds.minX) / rangeX
-    const ny = (dataY - this.dataBounds.minY) / rangeY
-    // 2) padding 一致
-    const pad = 0.05
-    const px0 = (nx * (1 - 2 * pad) + pad) * this.canvasSize.width
-    const py0 = (ny * (1 - 2 * pad) + pad) * this.canvasSize.height
-    // 3) 应用视图变换（CSS像素）
-    const sx = (px0 + this.transform.x) * this.transform.scale
-    const sy = (py0 + this.transform.y) * this.transform.scale
-    return { x: sx, y: sy }
+    const { minX, minY, maxX, maxY } = this.dataBounds
+    const { width, height } = this.canvasSize
+    const { x: tx, y: ty, scale } = this.transform
+    
+    // 1. 归一化到[0,1]
+    const rangeX = Math.max(1e-6, maxX - minX)
+    const rangeY = Math.max(1e-6, maxY - minY)
+    const nx = (dataX - minX) / rangeX
+    const ny = (dataY - minY) / rangeY
+    
+    // 2. 应用padding
+    const pad = MARKER_CONFIG.DATA_PADDING
+    const px = (nx * (1 - 2 * pad) + pad) * width
+    const py = (ny * (1 - 2 * pad) + pad) * height
+    
+    // 3. 应用视图变换
+    return {
+      x: (px + tx) * scale,
+      y: (py + ty) * scale
+    }
   }
   
   /**
@@ -114,142 +128,154 @@ export class RobotMarkers {
     }
     const Konva = window.Konva
     
-    // 转换到画布坐标
-    const canvasPos = this.dataToCanvas(startPosition.x, startPosition.y)
-    
-    // 创建起点标记（固定）
-    const startGroup = new Konva.Group({
-      x: canvasPos.x,
-      y: canvasPos.y
-    })
-    
-    // 起点外圈
-    const startOuter = new Konva.Circle({
-      radius: this.config.startMarker.radius,
-      stroke: `rgb(${color[0] * 255}, ${color[1] * 255}, ${color[2] * 255})`,
-      strokeWidth: this.config.startMarker.strokeWidth,
-      fill: `rgba(${color[0] * 255}, ${color[1] * 255}, ${color[2] * 255}, 0.2)`,
-      opacity: this.config.startMarker.opacity
-    })
-    
-    // 起点中心点
-    const startCenter = new Konva.Circle({
-      radius: 3,
-      fill: `rgb(${color[0] * 255}, ${color[1] * 255}, ${color[2] * 255})`
-    })
-    
-    // 起点文字标签
-    startGroup.add(startOuter)
-    startGroup.add(startCenter)
-    
-    // 创建当前位置标记（移动 + 呼吸灯）
-    const currentGroup = new Konva.Group({
-      x: canvasPos.x,
-      y: canvasPos.y
-    })
-    
-    // 呼吸灯外圈（脉冲动画）
-    const pulseCircle = new Konva.Circle({
-      radius: this.config.currentMarker.pulseRadius,
-      fill: `rgba(${color[0] * 255}, ${color[1] * 255}, ${color[2] * 255}, ${this.config.currentMarker.pulseOpacity})`,
-      opacity: 0
-    })
-    
-    // 当前位置主体
-    const currentCircle = new Konva.Circle({
-      radius: this.config.currentMarker.radius,
-      fill: `rgb(${color[0] * 255}, ${color[1] * 255}, ${color[2] * 255})`,
-      stroke: '#ffffff',
-      strokeWidth: this.config.currentMarker.strokeWidth,
-      shadowColor: `rgb(${color[0] * 255}, ${color[1] * 255}, ${color[2] * 255})`,
-      shadowBlur: 10,
-      shadowOpacity: 0.5
-    })
-    
-    // 方向指示器（小三角）
-    const directionArrow = new Konva.RegularPolygon({
-      sides: 3,
-      radius: 6,
-      fill: '#ffffff',
-      rotation: 0,
-      offsetY: -this.config.currentMarker.radius - 5
-    })
-    
-    const currentLabel = new Konva.Text({
-      text: `R${robotId + 1}`,
-      fontSize: 12,
-      fill: '#ffffff',
-      offsetX: -14,
-      offsetY: -24
-    })
-    
-    currentGroup.add(pulseCircle)
-    currentGroup.add(currentCircle)
-    currentGroup.add(directionArrow)
-    currentGroup.add(currentLabel)
-    
-    // 添加到层
-    this.konvaLayer.overlayLayer.add(startGroup)
-    this.konvaLayer.overlayLayer.add(currentGroup)
-    
     // 保存引用
-    this.markers.set(robotId, {
-      startGroup,
-      currentGroup,
-      pulseCircle,
-      currentCircle,
-      directionArrow,
-      currentLabel,
+    const markerData = {
       color,
-      dataPosition: { x: startPosition.x, y: startPosition.y },  // 保存原始数据坐标
+      dataPosition: { x: startPosition.x, y: startPosition.y },
       startDataPosition: { x: startPosition.x, y: startPosition.y }
-    })
+    }
     
-    // 启动呼吸灯动画
-    this.startBreathingAnimation(robotId)
+    // WebGL模式：起点也由WebGL渲染，不创建Konva起点标记
+    if (!this.useWebGLMarkers) {
+      // Konva模式：创建起点标记
+      const canvasPos = this.dataToCanvas(startPosition.x, startPosition.y)
+      
+      const startGroup = new Konva.Group({
+        x: canvasPos.x,
+        y: canvasPos.y
+      })
+      
+      const startCfg = MARKER_CONFIG.START
+      const colorStr = `rgb(${color[0] * 255}, ${color[1] * 255}, ${color[2] * 255})`
+      const startOuter = new Konva.Circle({
+        radius: startCfg.radius,
+        stroke: colorStr,
+        strokeWidth: startCfg.strokeWidth,
+        fill: `rgba(${color[0] * 255}, ${color[1] * 255}, ${color[2] * 255}, 0.2)`,
+        opacity: startCfg.opacity
+      })
+      
+      const startCenter = new Konva.Circle({
+        radius: 3,
+        fill: colorStr
+      })
+      
+      startGroup.add(startOuter)
+      startGroup.add(startCenter)
+      this.konvaLayer.overlayLayer.add(startGroup)
+      
+      markerData.startGroup = startGroup
+    }
+    
+    // 如果不使用WebGL标记，创建Konva当前位置标记
+    if (!this.useWebGLMarkers) {
+      const canvasPos = this.dataToCanvas(startPosition.x, startPosition.y)
+      const currentGroup = new Konva.Group({
+        x: canvasPos.x,
+        y: canvasPos.y
+      })
+      
+      const currentCfg = MARKER_CONFIG.CURRENT
+      const colorRgba = `rgba(${color[0] * 255}, ${color[1] * 255}, ${color[2] * 255}, ${currentCfg.pulseOpacity})`
+      
+      const pulseCircle = new Konva.Circle({
+        radius: currentCfg.pulseRadius,
+        fill: colorRgba,
+        opacity: 0
+      })
+      
+      const currentCircle = new Konva.Circle({
+        radius: currentCfg.radius,
+        fill: colorStr,
+        stroke: '#ffffff',
+        strokeWidth: currentCfg.strokeWidth
+      })
+      
+      const directionArrow = new Konva.RegularPolygon({
+        sides: 3,
+        radius: 6,
+        fill: '#ffffff',
+        rotation: 0,
+        offsetY: -currentCfg.radius - 5
+      })
+      
+      const currentLabel = new Konva.Text({
+        text: `R${robotId + 1}`,
+        fontSize: 12,
+        fill: '#ffffff',
+        offsetX: -14,
+        offsetY: -24
+      })
+      
+      currentGroup.add(pulseCircle)
+      currentGroup.add(currentCircle)
+      currentGroup.add(directionArrow)
+      currentGroup.add(currentLabel)
+      
+      this.konvaLayer.overlayLayer.add(currentGroup)
+      
+      Object.assign(markerData, {
+        currentGroup,
+        pulseCircle,
+        currentCircle,
+        directionArrow,
+        currentLabel
+      })
+      
+      // 启动Konva动画
+      this.startBreathingAnimation(robotId)
+    }
+    
+    this.markers.set(robotId, markerData)
     
     this.konvaLayer.overlayLayer.draw()
   }
   
   /**
-   * 启动呼吸灯动画
+   * 启动全局动画循环（所有机器人共享）
    */
   startBreathingAnimation(robotId) {
-    const marker = this.markers.get(robotId)
-    if (!marker) return
+    if (!this.animationEnabled) return
     
-    // Konva应该已经在KonvaLayer中被加载
-    if (!window.Konva) {
-      console.error('Konva not found. Make sure KonvaLayer is initialized first.')
-      return
+    // 如果全局动画未启动，启动它
+    if (!this.globalAnimation && window.Konva) {
+      this._startGlobalAnimation()
     }
-    const Konva = window.Konva
-    
-    // 脉冲动画
-    const pulseAnimation = new Konva.Animation((frame) => {
-      const scale = 1 + Math.sin(frame.time * 0.002) * 0.5
-      const opacity = 0.5 - Math.sin(frame.time * 0.002) * 0.3
-      
-      marker.pulseCircle.scaleX(scale)
-      marker.pulseCircle.scaleY(scale)
-      marker.pulseCircle.opacity(opacity)
-    }, this.konvaLayer.overlayLayer)
-    
-    // 光晕动画
-    const glowAnimation = new Konva.Animation((frame) => {
-      const glowIntensity = 10 + Math.sin(frame.time * 0.003) * 5
-      marker.currentCircle.shadowBlur(glowIntensity)
-    }, this.konvaLayer.overlayLayer)
-    
-    pulseAnimation.start()
-    glowAnimation.start()
-    
-    // 保存动画引用
-    this.animations.set(robotId, { pulseAnimation, glowAnimation })
   }
   
   /**
-   * 更新机器人当前位置
+   * 启动全局动画（单一RAF循环管理所有机器人）
+   */
+  _startGlobalAnimation() {
+    if (!window.Konva || this.globalAnimation) return
+    
+    let lastUpdateTime = 0
+    const updateInterval = MARKER_CONFIG.CURRENT.animationInterval
+    
+    this.globalAnimation = new window.Konva.Animation((frame) => {
+      if (!this.animationEnabled) return
+      if (frame.time - lastUpdateTime < updateInterval) return
+      lastUpdateTime = frame.time
+      
+      // 批量更新所有机器人的动画（只更新脉冲，移除昂贵的shadowBlur）
+      for (const [robotId, marker] of this.markers) {
+        if (!marker.pulseCircle) continue
+        
+        // 脉冲效果
+        const scale = 1 + Math.sin(frame.time * 0.002) * 0.5
+        const opacity = 0.5 - Math.sin(frame.time * 0.002) * 0.3
+        marker.pulseCircle.scaleX(scale)
+        marker.pulseCircle.scaleY(scale)
+        marker.pulseCircle.opacity(opacity)
+      }
+    }, this.konvaLayer.overlayLayer)
+    
+    this.globalAnimation.start()
+    console.log('RobotMarkers: 全局动画循环已启动')
+  }
+  
+  /**
+   * 更新机器人当前位置（WebGL模式下跳过）
    */
   updateRobotPosition(robotId, position, direction = 0) {
     const marker = this.markers.get(robotId)
@@ -257,6 +283,12 @@ export class RobotMarkers {
     
     // 保存数据坐标
     marker.dataPosition = { x: position.x, y: position.y }
+    
+    // WebGL模式：当前位置由WebGL渲染，不更新Konva标记
+    if (this.useWebGLMarkers) return
+    
+    // Konva模式：更新当前位置标记
+    if (!marker.currentGroup) return
     
     // 转换到画布坐标
     const canvasPos = this.dataToCanvas(position.x, position.y)
@@ -266,7 +298,7 @@ export class RobotMarkers {
     marker.currentGroup.y(canvasPos.y)
     
     // 更新方向指示器
-    if (direction !== undefined) {
+    if (direction !== undefined && marker.directionArrow) {
       marker.directionArrow.rotation(direction * 180 / Math.PI + 90)
     }
   }
@@ -275,18 +307,23 @@ export class RobotMarkers {
    * 更新所有标记位置（当边界或画布大小改变时）
    */
   updateAllMarkerPositions() {
+    // WebGL模式：所有标记由WebGL渲染，无需更新Konva对象
+    if (this.useWebGLMarkers) return
+    
+    // Konva模式：更新起点和当前位置
     for (const [robotId, marker] of this.markers) {
-      if (marker.dataPosition) {
+      // 更新起点位置
+      if (marker.startDataPosition && marker.startGroup) {
+        const startCanvasPos = this.dataToCanvas(marker.startDataPosition.x, marker.startDataPosition.y)
+        marker.startGroup.x(startCanvasPos.x)
+        marker.startGroup.y(startCanvasPos.y)
+      }
+      
+      // 更新当前位置标记
+      if (marker.dataPosition && marker.currentGroup) {
         const canvasPos = this.dataToCanvas(marker.dataPosition.x, marker.dataPosition.y)
         marker.currentGroup.x(canvasPos.x)
         marker.currentGroup.y(canvasPos.y)
-        
-        // 也更新起点位置（如果有）
-        if (marker.startDataPosition) {
-          const startCanvasPos = this.dataToCanvas(marker.startDataPosition.x, marker.startDataPosition.y)
-          marker.startGroup.x(startCanvasPos.x)
-          marker.startGroup.y(startCanvasPos.y)
-        }
       }
     }
     this.konvaLayer.overlayLayer.batchDraw()
@@ -321,22 +358,29 @@ export class RobotMarkers {
           )
         }
         
+        // 更新机器人位置数据（WebGL模式只保存数据）
         this.updateRobotPosition(
           robot.id,
           robot.currentPosition,
           robot.direction
         )
 
-        const marker = this.markers.get(robot.id)
-        if (marker && marker.startDataPosition) {
-          const startCanvasPos = this.dataToCanvas(marker.startDataPosition.x, marker.startDataPosition.y)
-          marker.startGroup.x(startCanvasPos.x)
-          marker.startGroup.y(startCanvasPos.y)
+        // Konva模式：更新起点标记位置
+        if (!this.useWebGLMarkers) {
+          const marker = this.markers.get(robot.id)
+          if (marker && marker.startDataPosition && marker.startGroup) {
+            const startCanvasPos = this.dataToCanvas(marker.startDataPosition.x, marker.startDataPosition.y)
+            marker.startGroup.x(startCanvasPos.x)
+            marker.startGroup.y(startCanvasPos.y)
+          }
         }
       }
     }
 
-    this.konvaLayer.overlayLayer.batchDraw()
+    // Konva模式才需要重绘
+    if (!this.useWebGLMarkers && this.konvaLayer) {
+      this.konvaLayer.overlayLayer.batchDraw()
+    }
     this._boundsDirty = false
   }
   
@@ -344,14 +388,20 @@ export class RobotMarkers {
    * 设置机器人焦点（高亮显示）
    */
   setFocus(robotId) {
-    // 重置所有标记的透明度
+    // WebGL模式：焦点由WebGL着色器控制（未来可扩展）
+    if (this.useWebGLMarkers) {
+      console.log(`WebGL模式：焦点设置为机器人 ${robotId}`)
+      return
+    }
+    
+    // Konva模式：重置所有标记的透明度
     for (const [id, marker] of this.markers) {
       if (id === robotId) {
-        marker.currentGroup.opacity(1)
-        marker.startGroup.opacity(1)
+        marker.currentGroup?.opacity(1)
+        marker.startGroup?.opacity(1)
       } else {
-        marker.currentGroup.opacity(0.5)
-        marker.startGroup.opacity(0.5)
+        marker.currentGroup?.opacity(0.5)
+        marker.startGroup?.opacity(0.5)
       }
     }
     this.konvaLayer.overlayLayer.draw()
@@ -364,19 +414,17 @@ export class RobotMarkers {
     const marker = this.markers.get(robotId)
     if (!marker) return
     
-    // 停止动画
-    const animations = this.animations.get(robotId)
-    if (animations) {
-      animations.pulseAnimation.stop()
-      animations.glowAnimation.stop()
-      this.animations.delete(robotId)
+    // 移除图形
+    marker.startGroup?.destroy()
+    marker.currentGroup?.destroy()
+    this.markers.delete(robotId)
+    
+    // 如果没有机器人了，停止全局动画
+    if (this.markers.size === 0 && this.globalAnimation) {
+      this.globalAnimation.stop()
+      this.globalAnimation = null
     }
     
-    // 移除图形
-    marker.startGroup.destroy()
-    marker.currentGroup.destroy()
-    
-    this.markers.delete(robotId)
     this.konvaLayer.overlayLayer.draw()
   }
   
@@ -384,8 +432,18 @@ export class RobotMarkers {
    * 清空所有标记
    */
   clear() {
-    for (const robotId of this.markers.keys()) {
-      this.removeRobot(robotId)
+    // 停止全局动画
+    if (this.globalAnimation) {
+      this.globalAnimation.stop()
+      this.globalAnimation = null
     }
+    
+    // 销毁所有标记
+    for (const marker of this.markers.values()) {
+      marker.startGroup?.destroy()
+      marker.currentGroup?.destroy()
+    }
+    this.markers.clear()
+    this.konvaLayer.overlayLayer.draw()
   }
 }
